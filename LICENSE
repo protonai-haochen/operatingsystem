@@ -19,3 +19,24 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+
+### **2. BUILD.md**
+```markdown
+# LightOS Build Guide
+
+## Prerequisites
+- x86_64 system (or Codespaces)
+- 2GB RAM minimum
+- 10GB free disk space
+
+## Build Process
+
+### 1. Initial Setup
+```bash
+# Clone or extract LightOS
+cd lightos-prototype
+
+# Make scripts executable
+chmod +x scripts/*.sh
+chmod +x uefi/build.sh
