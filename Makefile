@@ -20,11 +20,17 @@ all: $(EFI_DIR)/$(EFI_TARGET)
 $(EFI_DIR)/$(EFI_TARGET): uefi/main.c
 	mkdir -p $(BUILD_DIR) $(EFI_DIR)
 	$(CC) $(CFLAGS) -c $< -o $(BUILD_DIR)/main.o
-	$(LD) $(BUILD_DIR)/main.o $(LDFLAGS) -o $(BUILD_DIR)/main.so
+	$(LD) -nostdlib -znocombreloc \
+	  /usr/lib/crt0-efi-x86_64.o \
+	  $(BUILD_DIR)/main.o \
+	  -L/usr/lib \
+	  -lefi -lgnuefi \
+	  -o $(BUILD_DIR)/main.so
 	objcopy -j .text -j .sdata -j .data -j .dynamic -j .dynsym \
 	        -j .rel -j .rela -j .reloc --target=efi-app-$(ARCH) \
 	        $(BUILD_DIR)/main.so $(EFI_DIR)/$(EFI_TARGET)
 	cp $(EFI_DIR)/$(EFI_TARGET) $(BUILD_DIR)/$(EFI_TARGET)
+
 
 clean:
 	rm -rf $(BUILD_DIR)
