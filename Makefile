@@ -21,15 +21,16 @@ $(EFI_DIR)/$(EFI_TARGET): uefi/main.c
 	mkdir -p $(BUILD_DIR) $(EFI_DIR)
 	$(CC) $(CFLAGS) -c $< -o $(BUILD_DIR)/main.o
 	$(LD) -nostdlib \
-  -T /usr/lib/elf_x86_64_efi.lds \
-  /usr/lib/crt0-efi-x86_64.o \
-  $(BUILD_DIR)/main.o \
-  /usr/lib/libefi.a \
-  /usr/lib/libgnuefi.a \
-  --oformat=efi-app-x86_64 \
-  -o $(BUILD_DIR)/main.so
-   objcopy -j .text -j .sdata -j .data -j .dynamic -j .dynsym \
-	        -j .rel -j .rela -j .reloc --target=efi-app-$(ARCH) \
+	  -T /usr/lib/elf_x86_64_efi.lds \
+	  /usr/lib/crt0-efi-x86_64.o \
+	  $(BUILD_DIR)/main.o \
+	  /usr/lib/libefi.a \
+	  /usr/lib/libgnuefi.a \
+	  --oformat=efi-app-x86_64 \
+	  -o $(BUILD_DIR)/main.so
+	objcopy -j .text -j .sdata -j .data -j .dynamic -j .dynsym \
+	        -j .rel -j .rela -j .reloc \
+	        --target=efi-app-x86_64 \
 	        $(BUILD_DIR)/main.so $(EFI_DIR)/$(EFI_TARGET)
 	cp $(EFI_DIR)/$(EFI_TARGET) $(BUILD_DIR)/$(EFI_TARGET)
 
