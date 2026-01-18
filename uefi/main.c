@@ -1,207 +1,155 @@
 #include <efi.h>
 #include <efilib.h>
 
-typedef struct {
-    UINT64 framebuffer_base;
-    UINT32 framebuffer_width;
-    UINT32 framebuffer_height;
-    UINT32 framebuffer_pitch;
-} BOOTINFO;
+#define KERNEL_PATH      L"\\kernel.bin"
+#define KERNEL_LOAD_ADDR 0x00100000ULL
 
-// ---------------------------------------------------------------------
-// Graphics init (GOP)
-// ---------------------------------------------------------------------
-static EFI_STATUS init_graphics(EFI_GRAPHICS_OUTPUT_PROTOCOL **Gop,
-                                BOOTINFO *bi) {
-    EFI_STATUS Status;
-    EFI_GRAPHICS_OUTPUT_PROTOCOL *gop;
-    EFI_GUID gopGuid = EFI_GRAPHICS_OUTPUT_PROTOCOL_GUID;
+// Kernel entry: must match kernel/core/kernel.c
+typedef void (*kernel_entry_t)(
+    UINT64 fb_base,
+    UINT32 width,
+    UINT32 height,
+    UINT32 pitch
+);
 
-    Status = uefi_call_wrapper(BS->LocateProtocol, 3,
-                               &gopGuid, NULL, (VOID **)&gop);
-    if (EFI_ERROR(Status)) {
-        Print(L"[boot] LocateProtocol(GOP) failed: %r\r\n", Status);
-        return Status;
-    }
-
-    *Gop = gop;
-
-    bi->framebuffer_base   = gop->Mode->FrameBufferBase;
-    bi->framebuffer_width  = gop->Mode->Info->HorizontalResolution;
-    bi->framebuffer_height = gop->Mode->Info->VerticalResolution;
-    bi->framebuffer_pitch  = gop->Mode->Info->PixelsPerScanLine;
-
-    Print(L"[boot] Framebuffer @ 0x%lx (%ux%u, pitch %u)\r\n",
-          bi->framebuffer_base,
-          bi->framebuffer_width,
-          bi->framebuffer_height,
-          bi->framebuffer_pitch);
-
-    return EFI_SUCCESS;
-}
-
-// ---------------------------------------------------------------------
-// Open the filesystem root of the disk we were loaded from
-// This avoids LibOpenRoot and uses the raw FileSystemProtocol path that
-// gnu-efi examples use.
-// ---------------------------------------------------------------------
-static EFI_STATUS open_root(EFI_HANDLE ImageHandle, EFI_FILE_HANDLE *Root) {
-    EFI_STATUS Status;
-    EFI_LOADED_IMAGE       *LoadedImage;
-    EFI_FILE_IO_INTERFACE  *IOVolume;
-
-    //
-    // 1) Get EFI_LOADED_IMAGE for this image
-    //
-    Status = uefi_call_wrapper(BS->HandleProtocol, 3,
-                               ImageHandle,
-                               &LoadedImageProtocol,
-                               (VOID **)&LoadedImage);
-    if (EFI_ERROR(Status)) {
-        Print(L"[boot] HandleProtocol(LoadedImage) failed: %r\r\n", Status);
-        return Status;
-    }
-
-    //
-    // 2) Get the FileSystemProtocol for the device we were loaded from
-    //    NOTE: GUID name here is FileSystemProtocol (this is what gnu-efi
-    //    actually defines; earlier we used LibOpenRoot which hides this).
-    //
-    Status = uefi_call_wrapper(BS->HandleProtocol, 3,
-                               LoadedImage->DeviceHandle,
-                               &FileSystemProtocol,
-                               (VOID **)&IOVolume);
-    if (EFI_ERROR(Status)) {
-        Print(L"[boot] HandleProtocol(FileSystemProtocol) failed: %r\r\n", Status);
-        return Status;
-    }
-
-    //
-    // 3) Open the volume root
-    //
-    Status = uefi_call_wrapper(IOVolume->OpenVolume, 2, IOVolume, Root);
-    if (EFI_ERROR(Status)) {
-        Print(L"[boot] OpenVolume failed: %r\r\n", Status);
-        return Status;
-    }
-
-    return EFI_SUCCESS;
-}
-
-// ---------------------------------------------------------------------
-// Load \kernel.bin into memory at 0x00100000 and return pointer + size
-// ---------------------------------------------------------------------
-static EFI_STATUS load_kernel(EFI_HANDLE ImageHandle,
-                              EFI_PHYSICAL_ADDRESS *KernelAddr,
-                              UINTN *KernelSize) {
-    EFI_STATUS Status;
-    EFI_FILE_HANDLE Root;
-    EFI_FILE_HANDLE File;
-
-    Status = open_root(ImageHandle, &Root);
-    if (EFI_ERROR(Status)) {
-        Print(L"[boot] open_root failed: %r\r\n", Status);
-        return Status;
-    }
-
-    //
-    // kernel.bin is in the ROOT of the volume (FS0:\kernel.bin)
-    //
-    Status = uefi_call_wrapper(Root->Open, 5,
-                               Root,
-                               &File,
-                               L"kernel.bin",
-                               EFI_FILE_MODE_READ,
-                               0);
-    if (EFI_ERROR(Status)) {
-        Print(L"[boot] open kernel.bin failed: %r\r\n", Status);
-        return Status;
-    }
-
-    //
-    // Allocate 1 MiB at physical 1 MiB
-    //
-    EFI_PHYSICAL_ADDRESS Dest = 0x00100000;
-    UINTN Pages = EFI_SIZE_TO_PAGES(1024 * 1024);
-
-    Status = uefi_call_wrapper(BS->AllocatePages, 4,
-                               AllocateAddress,
-                               EfiLoaderCode,
-                               Pages,
-                               &Dest);
-    if (EFI_ERROR(Status)) {
-        Print(L"[boot] AllocatePages failed: %r\r\n", Status);
-        uefi_call_wrapper(File->Close, 1, File);
-        return Status;
-    }
-
-    UINTN BufferSize = 1024 * 1024;
-    Status = uefi_call_wrapper(File->Read, 3,
-                               File,
-                               &BufferSize,
-                               (VOID *)(UINTN)Dest);
-    if (EFI_ERROR(Status)) {
-        Print(L"[boot] File->Read failed: %r\r\n", Status);
-        uefi_call_wrapper(File->Close, 1, File);
-        return Status;
-    }
-
-    uefi_call_wrapper(File->Close, 1, File);
-
-    *KernelAddr = Dest;
-    *KernelSize = BufferSize;
-
-    Print(L"[boot] kernel.bin loaded at 0x%lx (%lu bytes)\r\n",
-          Dest, BufferSize);
-
-    return EFI_SUCCESS;
-}
-
-// ---------------------------------------------------------------------
-// UEFI entrypoint
-// ---------------------------------------------------------------------
-EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle,
-                           EFI_SYSTEM_TABLE *SystemTable) {
+EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable) {
     InitializeLib(ImageHandle, SystemTable);
 
     Print(L"LightOS UEFI bootloader starting...\r\n");
 
     EFI_STATUS Status;
-    EFI_GRAPHICS_OUTPUT_PROTOCOL *Gop = NULL;
-    BOOTINFO bi;
 
-    Status = init_graphics(&Gop, &bi);
+    // --- 1. Get LOADED_IMAGE for this application ---
+    EFI_LOADED_IMAGE *LoadedImage = NULL;
+    Status = uefi_call_wrapper(
+        BS->HandleProtocol, 3,
+        ImageHandle,
+        &gEfiLoadedImageProtocolGuid,
+        (VOID **)&LoadedImage
+    );
     if (EFI_ERROR(Status)) {
-        Print(L"[boot] init_graphics failed: %r\r\n", Status);
-        // We could still continue in text mode, but for now just carry on.
-    }
-
-    EFI_PHYSICAL_ADDRESS KernelAddr = 0;
-    UINTN KernelSize = 0;
-
-    Status = load_kernel(ImageHandle, &KernelAddr, &KernelSize);
-    if (EFI_ERROR(Status)) {
-        Print(L"[boot] load_kernel failed: %r\r\n", Status);
-        Print(L"[boot] Halting in bootloader.\r\n");
-        for (;;) {
-            __asm__ __volatile__("hlt");
-        }
+        Print(L"[boot] HandleProtocol(LoadedImage) failed: %r\r\n", Status);
         return Status;
     }
 
-    Print(L"[boot] Jumping to kernel at 0x%lx\r\n", KernelAddr);
-
-    typedef void (*kernel_entry_t)(BOOTINFO *);
-    kernel_entry_t entry = (kernel_entry_t)(UINTN)KernelAddr;
-
-    // Transfer control to the kernel
-    entry(&bi);
-
-    // If the kernel ever returns, just halt.
-    Print(L"[boot] Kernel returned, halting.\r\n");
-    for (;;) {
-        __asm__ __volatile__("hlt");
+    // --- 2. Get SimpleFileSystem from the device we were loaded from ---
+    EFI_SIMPLE_FILE_SYSTEM_PROTOCOL *FileSystem = NULL;
+    Status = uefi_call_wrapper(
+        BS->HandleProtocol, 3,
+        LoadedImage->DeviceHandle,
+        &gEfiSimpleFileSystemProtocolGuid,
+        (VOID **)&FileSystem
+    );
+    if (EFI_ERROR(Status)) {
+        Print(L"[boot] HandleProtocol(SimpleFileSystem) failed: %r\r\n", Status);
+        return Status;
     }
 
+    // --- 3. Open the volume and then \kernel.bin ---
+    EFI_FILE_HANDLE Volume = NULL;
+    Status = uefi_call_wrapper(FileSystem->OpenVolume, 2, FileSystem, &Volume);
+    if (EFI_ERROR(Status)) {
+        Print(L"[boot] OpenVolume failed: %r\r\n", Status);
+        return Status;
+    }
+
+    EFI_FILE_HANDLE KernelFile = NULL;
+    Status = uefi_call_wrapper(
+        Volume->Open, 5,
+        Volume,
+        &KernelFile,
+        KERNEL_PATH,
+        EFI_FILE_MODE_READ,
+        0
+    );
+    if (EFI_ERROR(Status)) {
+        Print(L"[boot] Failed to open %s: %r\r\n", KERNEL_PATH, Status);
+        return Status;
+    }
+
+    // --- 4. Get file size (EFI_FILE_INFO) ---
+    EFI_FILE_INFO *FileInfo = NULL;
+    UINTN InfoSize = SIZE_OF_EFI_FILE_INFO + 256;
+
+    Status = uefi_call_wrapper(
+        BS->AllocatePool, 3,
+        EfiLoaderData,
+        InfoSize,
+        (VOID **)&FileInfo
+    );
+    if (EFI_ERROR(Status)) {
+        Print(L"[boot] AllocatePool(FileInfo) failed: %r\r\n", Status);
+        return Status;
+    }
+
+    Status = uefi_call_wrapper(
+        KernelFile->GetInfo, 4,
+        KernelFile,
+        &gEfiFileInfoGuid,
+        &InfoSize,
+        FileInfo
+    );
+    if (EFI_ERROR(Status)) {
+        Print(L"[boot] GetInfo(FileInfo) failed: %r\r\n", Status);
+        return Status;
+    }
+
+    UINTN KernelSize = (UINTN)FileInfo->FileSize;
+    Print(L"[boot] kernel.bin size: %lu bytes\r\n", KernelSize);
+
+    // --- 5. Read kernel into physical address 0x00100000 ---
+    VOID *KernelBuffer = (VOID *)(UINTN)KERNEL_LOAD_ADDR;
+    UINTN ReadSize = KernelSize;
+
+    Status = uefi_call_wrapper(
+        KernelFile->Read, 3,
+        KernelFile,
+        &ReadSize,
+        KernelBuffer
+    );
+    if (EFI_ERROR(Status) || ReadSize != KernelSize) {
+        Print(L"[boot] Read(kernel.bin) failed: %r (read %lu / %lu)\r\n",
+              Status, ReadSize, KernelSize);
+        return Status;
+    }
+
+    Print(L"[boot] kernel.bin loaded at 0x%lx (%lu bytes)\r\n",
+          (UINT64)KERNEL_LOAD_ADDR, KernelSize);
+
+    // We’re done with the file handles.
+    uefi_call_wrapper(KernelFile->Close, 1, KernelFile);
+    uefi_call_wrapper(Volume->Close, 1, Volume);
+
+    // --- 6. Get graphics output protocol (for framebuffer info) ---
+    EFI_GRAPHICS_OUTPUT_PROTOCOL *Gop = NULL;
+    Status = uefi_call_wrapper(
+        BS->LocateProtocol, 3,
+        &gEfiGraphicsOutputProtocolGuid,
+        NULL,
+        (VOID **)&Gop
+    );
+    if (EFI_ERROR(Status)) {
+        Print(L"[boot] LocateProtocol(GOP) failed: %r\r\n", Status);
+        return Status;
+    }
+
+    UINT64 fb_base  = Gop->Mode->FrameBufferBase;
+    UINT32 fb_width = Gop->Mode->Info->HorizontalResolution;
+    UINT32 fb_height = Gop->Mode->Info->VerticalResolution;
+    UINT32 fb_pitch = Gop->Mode->Info->PixelsPerScanLine;
+
+    Print(L"[boot] Framebuffer @ 0x%lx (%ux%u, pitch %u)\r\n",
+          fb_base, fb_width, fb_height, fb_pitch);
+
+    // --- 7. Jump to kernel entry point ---
+    kernel_entry_t entry = (kernel_entry_t)(UINTN)KERNEL_LOAD_ADDR;
+
+    Print(L"[boot] Jumping to kernel at 0x%lx\r\n", (UINT64)KERNEL_LOAD_ADDR);
+
+    // Call into your kernel. This should NOT return in normal operation.
+    entry(fb_base, fb_width, fb_height, fb_pitch);
+
+    // If we get here, kernel actually returned.
+    Print(L"[boot] Kernel returned, halting.\r\n");
     return EFI_SUCCESS;
 }
