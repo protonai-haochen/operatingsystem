@@ -1,4 +1,4 @@
-name: Build LightOS UEFI
+name: Build LightOS UEFI + Kernel
 
 on:
   push:
@@ -7,16 +7,18 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install deps
+      - name: Install build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y gcc make gnu-efi mtools dosfstools
 
-      - name: Locate EFI toolchain files
+      # Optional: keep this if you like seeing where the EFI bits live
+      - name: Locate EFI toolchain files (debug)
         run: |
           echo "=== Searching for crt0-efi-x86_64.o ==="
           sudo find /usr -name "crt0-efi-x86_64.o" 2>/dev/null || true
@@ -27,7 +29,7 @@ jobs:
           echo "=== Searching for libgnuefi ==="
           sudo find /usr -name "libgnuefi*" 2>/dev/null || true
 
-      - name: Build BOOTX64.EFI
+      - name: Build bootloader and kernel
         run: |
           make
           echo "=== Build outputs ==="
@@ -37,11 +39,26 @@ jobs:
         run: |
           mkdir -p dist
           IMG=dist/lightos-uefi.img
+
+          # 64 MiB FAT32 image
           dd if=/dev/zero of="$IMG" bs=1M count=64
           mkfs.vfat -F 32 "$IMG"
+
+          # EFI directory structure
           mmd -i "$IMG" ::/EFI || true
           mmd -i "$IMG" ::/EFI/BOOT || true
+
+          # Copy bootloader
           mcopy -i "$IMG" build/EFI/BOOT/BOOTX64.EFI ::/EFI/BOOT/BOOTX64.EFI
+
+          # Copy kernel binary to root of volume
+          mcopy -i "$IMG" build/kernel.bin ::/kernel.bin
+
+          echo "=== Contents of image (FAT root) ==="
+          mdir -i "$IMG" ::
+
+          echo "=== Contents of /EFI/BOOT ==="
+          mdir -i "$IMG" ::/EFI/BOOT
 
       - name: Upload artifact (UEFI image)
         uses: actions/upload-artifact@v4
