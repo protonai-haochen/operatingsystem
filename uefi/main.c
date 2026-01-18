@@ -1,110 +1,201 @@
 #include <efi.h>
 #include <efilib.h>
+#include "../kernel/include/boot.h"
 
-EFI_GRAPHICS_OUTPUT_PROTOCOL *gop;
-UINT32 ScreenWidth, ScreenHeight, Pitch;
-UINT8 *FrameBuffer;
+typedef void (*KernelEntry)(BootInfo *boot_info);
 
-//
-// --- BASIC GRAPHICS API ---
-//
-
-void putpixel(UINT32 x, UINT32 y, UINT32 color) {
-    if (x >= ScreenWidth || y >= ScreenHeight) return;
-    UINT32 *pixel = (UINT32 *)(FrameBuffer + (x + y * Pitch) * 4);
-    *pixel = color;
-}
-
-void fill_rect(UINT32 x, UINT32 y, UINT32 w, UINT32 h, UINT32 color) {
-    for (UINT32 iy = 0; iy < h; iy++) {
-        for (UINT32 ix = 0; ix < w; ix++) {
-            putpixel(x + ix, y + iy, color);
-        }
-    }
-}
-
-void draw_rect(UINT32 x, UINT32 y, UINT32 w, UINT32 h, UINT32 color) {
-    // top
-    for (UINT32 i = 0; i < w; i++) putpixel(x + i, y, color);
-    // bottom
-    for (UINT32 i = 0; i < w; i++) putpixel(x + i, y + h - 1, color);
-    // left
-    for (UINT32 i = 0; i < h; i++) putpixel(x, y + i, color);
-    // right
-    for (UINT32 i = 0; i < h; i++) putpixel(x + w - 1, y + i, color);
-}
-
-//
-// --- DRAW CHROMEOS-LIKE WINDOW ---
-//
-
-void draw_window(UINT32 x, UINT32 y, UINT32 w, UINT32 h) {
-
-    UINT32 border = 0xFFCCCCCC;      // light gray border
-    UINT32 bg     = 0xFFFFFFFF;      // white window background
-    UINT32 title  = 0xFFEFEFEF;      // light gray title bar (flat, no rounding)
-    UINT32 shadow = 0x22000000;      // faint drop shadow
-
-    // Draw shadow (ChromeOS style: subtle rectangular shadow)
-    fill_rect(x + 4, y + 4, w, h, shadow);
-
-    // Draw window background
-    fill_rect(x, y, w, h, bg);
-
-    // Draw title bar (no rounded corners – square)
-    fill_rect(x, y, w, 28, title);
-
-    // Draw border
-    draw_rect(x, y, w, h, border);
-
-    // Draw title text (EFI text mode, not yet rendered in framebuffer)
-    // TODO: later we add custom bitmap font rendering
-    Print(L"[LightOS] Demo Window Drawn.\n");
-}
-
-//
-// --- ENTRY POINT ---
-//
-
-EFI_STATUS efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable) {
+EFI_STATUS
+efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable) {
     InitializeLib(ImageHandle, SystemTable);
-    Print(L"LightOS GUI Boot...\n");
+    Print(L"LightOS UEFI Bootloader\n");
 
+    EFI_STATUS status;
+
+    //
+    // 1. Locate GOP (graphics output) so we can hand framebuffer to kernel
+    //
     EFI_GUID gopGuid = EFI_GRAPHICS_OUTPUT_PROTOCOL_GUID;
-    EFI_STATUS status = uefi_call_wrapper(
+    EFI_GRAPHICS_OUTPUT_PROTOCOL *gop = NULL;
+
+    status = uefi_call_wrapper(
         SystemTable->BootServices->LocateProtocol,
-        3, &gopGuid, NULL, (void**)&gop
+        3,
+        &gopGuid,
+        NULL,
+        (void**)&gop
     );
-    if (EFI_ERROR(status)) {
-        Print(L"Could not load GOP: %r\n", status);
+    if (EFI_ERROR(status) || gop == NULL) {
+        Print(L"[BOOT] Failed to locate GOP: %r\n", status);
         return status;
     }
 
-    // Set graphics mode 0 (safe)
-    uefi_call_wrapper(gop->SetMode, 2, gop, 0);
+    UINT32 width  = gop->Mode->Info->HorizontalResolution;
+    UINT32 height = gop->Mode->Info->VerticalResolution;
+    UINT32 pitch  = gop->Mode->Info->PixelsPerScanLine;
+    EFI_PHYSICAL_ADDRESS fb_base = gop->Mode->FrameBufferBase;
 
-    // Load screen info
-    FrameBuffer = (UINT8*)gop->Mode->FrameBufferBase;
-    ScreenWidth = gop->Mode->Info->HorizontalResolution;
-    ScreenHeight = gop->Mode->Info->VerticalResolution;
-    Pitch = gop->Mode->Info->PixelsPerScanLine;
+    Print(L"[BOOT] GOP: %d x %d, pitch=%d\n", width, height, pitch);
 
-    // Fill background (ChromeOS blue-ish gray)
-    fill_rect(0, 0, ScreenWidth, ScreenHeight, 0xFFE5ECF4);
+    //
+    // 2. Open filesystem root
+    //
+    EFI_FILE_HANDLE root = LibOpenRoot(ImageHandle);
+    if (!root) {
+        Print(L"[BOOT] Failed to open filesystem root\n");
+        return EFI_LOAD_ERROR;
+    }
 
-    // Draw taskbar (ChromeOS style)
-    fill_rect(0, ScreenHeight - 48, ScreenWidth, 48, 0xFFFFFFFF);
+    //
+    // 3. Open kernel.bin from the volume root
+    //
+    EFI_FILE_HANDLE kernelFile;
+    status = uefi_call_wrapper(
+        root->Open,
+        5,
+        root,
+        &kernelFile,
+        L"kernel.bin",
+        EFI_FILE_MODE_READ,
+        0
+    );
+    if (EFI_ERROR(status)) {
+        Print(L"[BOOT] Failed to open kernel.bin: %r\n", status);
+        return status;
+    }
 
-    // Draw demo window centered
-    UINT32 winW = 600;
-    UINT32 winH = 400;
-    UINT32 winX = (ScreenWidth - winW) / 2;
-    UINT32 winY = (ScreenHeight - winH) / 2 - 20;
+    //
+    // 4. Get kernel file size
+    //
+    EFI_FILE_INFO *info = LibFileInfo(kernelFile);
+    if (!info) {
+        Print(L"[BOOT] LibFileInfo failed\n");
+        kernelFile->Close(kernelFile);
+        return EFI_LOAD_ERROR;
+    }
 
-    draw_window(winX, winY, winW, winH);
+    UINTN kernelSize = info->FileSize;
+    Print(L"[BOOT] kernel.bin size: %d bytes\n", (UINT32)kernelSize);
+    FreePool(info);
 
-    Print(L"GUI initialized.\n");
+    //
+    // 5. Allocate memory for kernel at 1 MiB (0x100000)
+    //
+    EFI_PHYSICAL_ADDRESS kernel_addr = 0x100000;
+    UINTN pages = (kernelSize + 0xFFF) / 0x1000;
 
-    while (1);
+    status = uefi_call_wrapper(
+        SystemTable->BootServices->AllocatePages,
+        4,
+        AllocateAddress,
+        EfiLoaderData,
+        pages,
+        &kernel_addr
+    );
+    if (EFI_ERROR(status)) {
+        Print(L"[BOOT] AllocatePages failed: %r\n", status);
+        kernelFile->Close(kernelFile);
+        return status;
+    }
+
+    //
+    // 6. Read kernel into memory
+    //
+    UINTN readSize = kernelSize;
+    status = uefi_call_wrapper(
+        kernelFile->Read,
+        3,
+        kernelFile,
+        &readSize,
+        (void*)kernel_addr
+    );
+    kernelFile->Close(kernelFile);
+
+    if (EFI_ERROR(status) || readSize != kernelSize) {
+        Print(L"[BOOT] Read kernel.bin failed: %r (read %d bytes)\n",
+              status, (UINT32)readSize);
+        return status;
+    }
+
+    Print(L"[BOOT] Kernel loaded at 0x%x (%d pages)\n",
+          (UINTN)kernel_addr, (UINT32)pages);
+
+    //
+    // 7. Build BootInfo struct for the kernel
+    //
+    BootInfo boot;
+    boot.framebuffer_base   = (uint64_t)fb_base;
+    boot.framebuffer_width  = width;
+    boot.framebuffer_height = height;
+    boot.framebuffer_pitch  = pitch;
+
+    //
+    // 8. Get memory map, then ExitBootServices (UEFI is gone after this)
+    //
+    UINTN mmapSize = 0;
+    EFI_MEMORY_DESCRIPTOR *mmap = NULL;
+    UINTN mapKey;
+    UINTN descSize;
+    UINT32 descVersion;
+
+    status = uefi_call_wrapper(
+        SystemTable->BootServices->GetMemoryMap,
+        5,
+        &mmapSize,
+        mmap,
+        &mapKey,
+        &descSize,
+        &descVersion
+    );
+
+    if (status == EFI_BUFFER_TOO_SMALL) {
+        mmapSize += descSize * 2;
+        status = uefi_call_wrapper(
+            SystemTable->BootServices->AllocatePool,
+            3,
+            EfiLoaderData,
+            mmapSize,
+            (void**)&mmap
+        );
+        if (EFI_ERROR(status)) {
+            Print(L"[BOOT] AllocatePool for memory map failed: %r\n", status);
+            return status;
+        }
+
+        status = uefi_call_wrapper(
+            SystemTable->BootServices->GetMemoryMap,
+            5,
+            &mmapSize,
+            mmap,
+            &mapKey,
+            &descSize,
+            &descVersion
+        );
+    }
+
+    if (EFI_ERROR(status)) {
+        Print(L"[BOOT] GetMemoryMap failed: %r\n", status);
+        return status;
+    }
+
+    status = uefi_call_wrapper(
+        SystemTable->BootServices->ExitBootServices,
+        2,
+        ImageHandle,
+        mapKey
+    );
+    if (EFI_ERROR(status)) {
+        // Proper retry logic is a bit more work; for now we just bail.
+        return status;
+    }
+
+    //
+    // 9. Jump to kernel entry point at 1 MiB
+    //
+    KernelEntry entry = (KernelEntry)( (UINTN)kernel_addr );
+    entry(&boot);
+
+    // Should never return
+    while (1) { }
+
     return EFI_SUCCESS;
 }
