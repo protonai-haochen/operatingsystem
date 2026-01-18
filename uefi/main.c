@@ -8,6 +8,9 @@ typedef struct {
     UINT32 framebuffer_pitch;
 } BOOTINFO;
 
+// ---------------------------------------------------------------------
+// Graphics init (GOP)
+// ---------------------------------------------------------------------
 static EFI_STATUS init_graphics(EFI_GRAPHICS_OUTPUT_PROTOCOL **Gop,
                                 BOOTINFO *bi) {
     EFI_STATUS Status;
@@ -37,13 +40,20 @@ static EFI_STATUS init_graphics(EFI_GRAPHICS_OUTPUT_PROTOCOL **Gop,
     return EFI_SUCCESS;
 }
 
-// Open the root of the filesystem the bootloader was loaded from.
-static EFI_STATUS open_root(EFI_HANDLE ImageHandle, EFI_FILE_HANDLE *Root) {
+// ---------------------------------------------------------------------
+// Load kernel.bin from the same disk as this UEFI app
+// ---------------------------------------------------------------------
+static EFI_STATUS load_kernel(EFI_HANDLE ImageHandle,
+                              EFI_PHYSICAL_ADDRESS *KernelAddr,
+                              UINTN *KernelSize) {
     EFI_STATUS Status;
     EFI_LOADED_IMAGE *LoadedImage;
-    EFI_SIMPLE_FILE_SYSTEM_PROTOCOL *SimpleFS;
+    EFI_FILE_HANDLE Root;
+    EFI_FILE_HANDLE File;
 
-    // Get EFI_LOADED_IMAGE for our ImageHandle
+    //
+    // 1) Get EFI_LOADED_IMAGE for our ImageHandle
+    //
     Status = uefi_call_wrapper(BS->HandleProtocol, 3,
                                ImageHandle,
                                &LoadedImageProtocol,
@@ -53,41 +63,20 @@ static EFI_STATUS open_root(EFI_HANDLE ImageHandle, EFI_FILE_HANDLE *Root) {
         return Status;
     }
 
-    // Get SimpleFS for the device that contains this image
-    Status = uefi_call_wrapper(BS->HandleProtocol, 3,
-                               LoadedImage->DeviceHandle,
-                               &SimpleFileSystemProtocol,
-                               (VOID **)&SimpleFS);
+    //
+    // 2) Open the filesystem root of the device we were loaded from.
+    //    IMPORTANT: use LoadedImage->DeviceHandle (this is what was wrong
+    //    in the older code that printed 'LibOpenRoot failed').
+    //
+    Status = LibOpenRoot(LoadedImage->DeviceHandle, &Root);
     if (EFI_ERROR(Status)) {
-        Print(L"[boot] HandleProtocol(SimpleFS) failed: %r\r\n", Status);
+        Print(L"[boot] LibOpenRoot failed: %r\r\n", Status);
         return Status;
     }
 
-    // Open the filesystem root
-    Status = uefi_call_wrapper(SimpleFS->OpenVolume, 2, SimpleFS, Root);
-    if (EFI_ERROR(Status)) {
-        Print(L"[boot] OpenVolume failed: %r\r\n", Status);
-        return Status;
-    }
-
-    return EFI_SUCCESS;
-}
-
-// Load kernel.bin into memory at 1 MiB and return its address + size.
-static EFI_STATUS load_kernel(EFI_HANDLE ImageHandle,
-                              EFI_PHYSICAL_ADDRESS *KernelAddr,
-                              UINTN *KernelSize) {
-    EFI_STATUS Status;
-    EFI_FILE_HANDLE Root;
-    EFI_FILE_HANDLE File;
-
-    Status = open_root(ImageHandle, &Root);
-    if (EFI_ERROR(Status)) {
-        Print(L"[boot] open_root failed: %r\r\n", Status);
-        return Status;
-    }
-
-    // kernel.bin is in the root of the volume
+    //
+    // 3) Open \kernel.bin from the root of that filesystem
+    //
     Status = uefi_call_wrapper(Root->Open, 5,
                                Root,
                                &File,
@@ -99,9 +88,12 @@ static EFI_STATUS load_kernel(EFI_HANDLE ImageHandle,
         return Status;
     }
 
-    // Allocate 1 MiB for the kernel at physical address 1 MiB
+    //
+    // 4) Allocate 1 MiB at physical 0x00100000 and read kernel.bin there
+    //
     EFI_PHYSICAL_ADDRESS Dest = 0x00100000;
     UINTN Pages = EFI_SIZE_TO_PAGES(1024 * 1024);
+
     Status = uefi_call_wrapper(BS->AllocatePages, 4,
                                AllocateAddress,
                                EfiLoaderCode,
@@ -135,6 +127,9 @@ static EFI_STATUS load_kernel(EFI_HANDLE ImageHandle,
     return EFI_SUCCESS;
 }
 
+// ---------------------------------------------------------------------
+// UEFI entrypoint
+// ---------------------------------------------------------------------
 EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle,
                            EFI_SYSTEM_TABLE *SystemTable) {
     InitializeLib(ImageHandle, SystemTable);
@@ -148,7 +143,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle,
     Status = init_graphics(&Gop, &bi);
     if (EFI_ERROR(Status)) {
         Print(L"[boot] init_graphics failed: %r\r\n", Status);
-        // We can still keep going without graphics if we want.
+        // We *could* continue in text mode, but for now just fall through.
     }
 
     EFI_PHYSICAL_ADDRESS KernelAddr = 0;
@@ -169,7 +164,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle,
     typedef void (*kernel_entry_t)(BOOTINFO *);
     kernel_entry_t entry = (kernel_entry_t)(UINTN)KernelAddr;
 
-    // Call into the kernel
+    // Transfer control to the kernel
     entry(&bi);
 
     // If the kernel ever returns, just halt.
@@ -180,4 +175,3 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle,
 
     return EFI_SUCCESS;
 }
-
