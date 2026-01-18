@@ -1,76 +1,81 @@
 ARCH := x86_64
-EFI_TARGET := BOOTX64.EFI
 
-CC := gcc
-LD := ld
+EFI_TARGET := BOOTX64.EFI
+KERNEL_ELF := build/kernel.elf
+KERNEL_BIN := build/kernel.bin
+
+CC      := gcc
+LD      := ld
 OBJCOPY := objcopy
 
+# UEFI headers
+EFI_INC ?= /usr/include/efi
+
+# These are filled in by the GitHub Actions workflow,
+# but we provide sane defaults for local builds.
+CRT0    ?= /usr/lib/crt0-efi-$(ARCH).o
+EFI_LDS ?= /usr/lib/elf_$(ARCH)_efi.lds
+EFILIB  ?= /usr/lib
+
+CFLAGS_COMMON := -ffreestanding -fno-stack-protector -fno-pic -mno-red-zone \
+                 -Wall -Wextra -O2
+
+EFI_CFLAGS := $(CFLAGS_COMMON) \
+              -fshort-wchar \
+              -I$(EFI_INC) -I$(EFI_INC)/$(ARCH) \
+              -DEFI_FUNCTION_WRAPPER
+
+KERNEL_CFLAGS := $(CFLAGS_COMMON) -m64 -Ikernel/include
+
+LIBGCC := $(shell $(CC) $(EFI_CFLAGS) -print-libgcc-file-name 2>/dev/null)
+
+EFI_LDFLAGS := -nostdlib -znocombreloc -T $(EFI_LDS)
+EFI_LIBS    := -L$(EFILIB) -lefi -lgnuefi $(LIBGCC)
+
+KERNEL_LDFLAGS := -nostdlib -z max-page-size=0x1000
+
 BUILD_DIR := build
-EFI_DIR := $(BUILD_DIR)/EFI/BOOT
-
-# ----------------------------------------------------------------------
-# UEFI bootloader build
-# ----------------------------------------------------------------------
-
-UEFI_CFLAGS := -I/usr/include/efi -I/usr/include/efi/$(ARCH) \
-               -Ikernel/include \
-               -fno-stack-protector -fpic -fshort-wchar -mno-red-zone \
-               -DEFI_FUNCTION_WRAPPER -Wall -Wextra -O2
-
-UEFI_LDFLAGS := -nostdlib -znocombreloc \
-                /usr/lib/crt0-efi-$(ARCH).o \
-                -L/usr/lib -lefi -lgnuefi
-
-UEFI_OBJ := $(BUILD_DIR)/bootloader.o
-
-# ----------------------------------------------------------------------
-# Kernel build
-# ----------------------------------------------------------------------
-
-KERNEL_ELF := $(BUILD_DIR)/kernel.elf
-KERNEL_BIN := $(BUILD_DIR)/kernel.bin
-KERNEL_OBJS := $(BUILD_DIR)/kernel.o
-KERNEL_LDS := kernel/link.ld
-
-KERNEL_CFLAGS := -ffreestanding -fno-stack-protector -mno-red-zone -m64 \
-                 -Wall -Wextra -O2 -Ikernel/include
-
-KERNEL_LDFLAGS := -nostdlib -z max-page-size=0x1000 -T $(KERNEL_LDS)
-
-# ----------------------------------------------------------------------
-# Targets
-# ----------------------------------------------------------------------
+EFI_DIR   := $(BUILD_DIR)/EFI/BOOT
 
 all: $(EFI_DIR)/$(EFI_TARGET) $(KERNEL_BIN)
 
-$(BUILD_DIR):
-	mkdir -p $(BUILD_DIR)
+# -----------------------
+# UEFI bootloader
+# -----------------------
 
-$(EFI_DIR): | $(BUILD_DIR)
+$(EFI_DIR)/$(EFI_TARGET): $(BUILD_DIR)/bootloader.elf
 	mkdir -p $(EFI_DIR)
+	$(OBJCOPY) \
+	    -j .text -j .sdata -j .data -j .dynamic -j .dynsym \
+	    -j .rel -j .rela -j .reloc \
+	    --target=efi-app-$(ARCH) \
+	    $< $@
 
-# --- UEFI bootloader (.efi) ---
+$(BUILD_DIR)/bootloader.elf: $(BUILD_DIR)/bootloader.o
+	mkdir -p $(BUILD_DIR)
+	$(LD) $(EFI_LDFLAGS) $(CRT0) $< \
+	    -shared -Bsymbolic \
+	    $(EFI_LIBS) \
+	    -o $@
 
-$(UEFI_OBJ): uefi/main.c | $(BUILD_DIR)
-	$(CC) $(UEFI_CFLAGS) -c $< -o $@
+$(BUILD_DIR)/bootloader.o: uefi/main.c
+	mkdir -p $(BUILD_DIR)
+	$(CC) $(EFI_CFLAGS) -c $< -o $@
 
-$(EFI_DIR)/$(EFI_TARGET): $(UEFI_OBJ) | $(EFI_DIR)
-	$(LD) $(UEFI_OBJ) $(UEFI_LDFLAGS) -o $(BUILD_DIR)/bootloader.so
-	$(OBJCOPY) -j .text -j .sdata -j .data -j .dynamic -j .dynsym \
-	           -j .rel -j .rela -j .reloc --target=efi-app-$(ARCH) \
-	           $(BUILD_DIR)/bootloader.so $(EFI_DIR)/$(EFI_TARGET)
-	cp $(EFI_DIR)/$(EFI_TARGET) $(BUILD_DIR)/$(EFI_TARGET)
-
-# --- Kernel binary ---
-
-$(KERNEL_OBJS): kernel/core/kernel.c | $(BUILD_DIR)
-	$(CC) $(KERNEL_CFLAGS) -c $< -o $@
-
-$(KERNEL_ELF): $(KERNEL_OBJS)
-	$(LD) $(KERNEL_LDFLAGS) -o $@ $^
+# -----------------------
+# Kernel
+# -----------------------
 
 $(KERNEL_BIN): $(KERNEL_ELF)
 	$(OBJCOPY) -O binary $< $@
+
+$(KERNEL_ELF): $(BUILD_DIR)/kernel.o kernel/link.ld
+	mkdir -p $(BUILD_DIR)
+	$(LD) $(KERNEL_LDFLAGS) -T kernel/link.ld $< -o $@
+
+$(BUILD_DIR)/kernel.o: kernel/core/kernel.c
+	mkdir -p $(BUILD_DIR)
+	$(CC) $(KERNEL_CFLAGS) -c $< -o $@
 
 clean:
 	rm -rf $(BUILD_DIR)
