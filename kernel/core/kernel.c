@@ -1,6 +1,13 @@
 #include <stdint.h>
 #include "../include/boot.h"
 
+/*
+ * Super minimal test kernel:
+ * - fills the screen with a blue-ish gradient
+ * - draws a square window in the middle
+ * - then hlt-loops forever (never returns to the bootloader)
+ */
+
 static inline void put_pixel(uint32_t* fb,
                              uint32_t pitch,
                              uint32_t x,
@@ -97,8 +104,6 @@ static void draw_window(uint32_t* fb,
     uint32_t border_color     = 0x00404040; // dark border
     uint32_t body_color       = 0x00F0F0F0; // light grey
     uint32_t titlebar_color   = 0x002A6FFF; // blue titlebar
-    uint32_t titlebar_inactive= 0x004A4A4A; // not used yet
-    (void)titlebar_inactive;               // silence unused warning
 
     uint32_t titlebar_height  = 28;
     if (titlebar_height + 4 > h) titlebar_height = h / 4;
@@ -125,10 +130,10 @@ static void draw_window(uint32_t* fb,
               screen_w, screen_h);
 
     // Fake close button (square, top-right)
-    uint32_t btn_size = titlebar_height - 8;
-    uint32_t btn_x = x + w - 2 - btn_size - 4;
-    uint32_t btn_y = y + 2 + 4;
-    uint32_t btn_bg = 0x00DD4444; // red-ish
+    uint32_t btn_size   = titlebar_height - 8;
+    uint32_t btn_x      = x + w - 2 - btn_size - 4;
+    uint32_t btn_y      = y + 2 + 4;
+    uint32_t btn_bg     = 0x00DD4444; // red-ish
     uint32_t btn_border = 0x00AA0000;
 
     // Button background
@@ -138,28 +143,35 @@ static void draw_window(uint32_t* fb,
               btn_bg,
               screen_w, screen_h);
 
-    // Button border (manual mini-rect outline)
-    // top
-    fill_rect(fb, pitch, btn_x, btn_y, btn_size, 1, btn_border, screen_w, screen_h);
-    // bottom
-    fill_rect(fb, pitch, btn_x, btn_y + btn_size - 1, btn_size, 1, btn_border, screen_w, screen_h);
-    // left
-    fill_rect(fb, pitch, btn_x, btn_y, 1, btn_size, btn_border, screen_w, screen_h);
-    // right
-    fill_rect(fb, pitch, btn_x + btn_size - 1, btn_y, 1, btn_size, btn_border, screen_w, screen_h);
+    // Button border
+    fill_rect(fb, pitch, btn_x,              btn_y,               btn_size, 1,           btn_border, screen_w, screen_h); // top
+    fill_rect(fb, pitch, btn_x,              btn_y + btn_size-1,  btn_size, 1,           btn_border, screen_w, screen_h); // bottom
+    fill_rect(fb, pitch, btn_x,              btn_y,               1,        btn_size,    btn_border, screen_w, screen_h); // left
+    fill_rect(fb, pitch, btn_x + btn_size-1, btn_y,               1,        btn_size,    btn_border, screen_w, screen_h); // right
 }
 
 void kernel_main(BootInfo* info)
 {
-    uint32_t* fb     = (uint32_t*)info->framebuffer_base;
-    uint32_t width   = info->framebuffer_width;
-    uint32_t height  = info->framebuffer_height;
-    uint32_t pitch   = info->framebuffer_pitch; // pixels per scanline
+    uint32_t* fb    = (uint32_t*)info->framebuffer_base;
+    uint32_t width  = info->framebuffer_width;
+    uint32_t height = info->framebuffer_height;
+    uint32_t pitch  = info->framebuffer_pitch; // pixels per scanline
 
-    // 1) Draw desktop background + shelf
+    // Safety: if something is weird with the framebuffer, just bail into a magenta screen
+    if (!fb || !width || !height || !pitch) {
+        // fallback solid magenta, just so we SEE something
+        for (uint32_t y = 0; y < 480; ++y) {
+            for (uint32_t x = 0; x < 640; ++x) {
+                fb[y * pitch + x] = 0x00FF00FF;
+            }
+        }
+        for (;;) { __asm__("hlt"); }
+    }
+
+    // Draw desktop + shelf
     draw_desktop(fb, pitch, width, height);
 
-    // 2) Draw one centered window
+    // Center window
     uint32_t win_w = width  / 2;
     uint32_t win_h = height / 2;
     uint32_t win_x = (width  - win_w) / 2;
@@ -167,10 +179,8 @@ void kernel_main(BootInfo* info)
 
     draw_window(fb, pitch, width, height, win_x, win_y, win_w, win_h);
 
-    // 3) Freeze so QEMU doesn’t drop back to firmware
+    // IMPORTANT: never return to the bootloader
     for (;;) {
         __asm__("hlt");
     }
 }
-
-
