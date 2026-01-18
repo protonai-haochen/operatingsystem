@@ -16,18 +16,6 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y gcc make gnu-efi mtools dosfstools
 
-      - name: Show gnu-efi paths (debug)
-        run: |
-          echo "=== EFI include dirs ==="
-          ls -la /usr/include/efi || true
-          ls -la /usr/include/efi/x86_64 || true
-          echo "=== EFI libs ==="
-          ls -la /usr/lib | grep efi || true
-          ls -la /usr/lib/*/ | grep efi || true
-          echo "=== crt0 files ==="
-          ls -la /usr/lib/crt0-efi* || true
-          ls -la /usr/lib/*/crt0-efi* || true
-
       - name: Build BOOTX64.EFI
         run: |
           make
