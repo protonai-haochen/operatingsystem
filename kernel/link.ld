@@ -2,26 +2,27 @@ ENTRY(kernel_main)
 
 SECTIONS
 {
-    . = 0x100000;  /* Load kernel at 1 MiB */
+    . = 0x100000;
 
-    .text :
+    .text : ALIGN(4K)
     {
         *(.text*)
     }
 
-    .rodata :
+    .rodata : ALIGN(4K)
     {
         *(.rodata*)
     }
 
-    .data :
+    .data : ALIGN(4K)
     {
         *(.data*)
     }
 
-    .bss :
+    .bss : ALIGN(4K)
     {
         *(.bss*)
         *(COMMON)
     }
 }
+
