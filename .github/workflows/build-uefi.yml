@@ -1,0 +1,36 @@
+name: Build LightOS UEFI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gnu-efi gcc make mtools dosfstools
+
+      - name: Build BOOTX64.EFI
+        run: make
+
+      - name: Create bootable FAT image
+        run: |
+          mkdir -p dist
+          IMG=dist/lightos-uefi.img
+          dd if=/dev/zero of="$IMG" bs=1M count=64
+          mkfs.vfat -F 32 "$IMG"
+          mmd -i "$IMG" ::/EFI || true
+          mmd -i "$IMG" ::/EFI/BOOT || true
+          mcopy -i "$IMG" build/EFI/BOOT/BOOTX64.EFI ::/EFI/BOOT/BOOTX64.EFI
+
+      - name: Upload artifact (UEFI image)
+        uses: actions/upload-artifact@v4
+        with:
+          name: lightos-uefi-image
+          path: dist/lightos-uefi.img
