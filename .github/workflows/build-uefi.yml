@@ -1,4 +1,4 @@
-name: Build LightOS UEFI + Kernel
+name: Build LightOS UEFI + kernel
 
 on:
   push:
@@ -9,7 +9,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
       - name: Install build dependencies
@@ -17,21 +17,28 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y gcc make gnu-efi mtools dosfstools
 
-      # Optional: keep this if you like seeing where the EFI bits live
-      - name: Locate EFI toolchain files (debug)
+      - name: Locate EFI toolchain files
         run: |
+          set -e
           echo "=== Searching for crt0-efi-x86_64.o ==="
-          sudo find /usr -name "crt0-efi-x86_64.o" 2>/dev/null || true
-
-          echo "=== Searching for libefi ==="
-          sudo find /usr -name "libefi*" 2>/dev/null || true
-
-          echo "=== Searching for libgnuefi ==="
-          sudo find /usr -name "libgnuefi*" 2>/dev/null || true
+          CRT0=$(sudo find /usr -name "crt0-efi-x86_64.o" -print -quit)
+          echo "CRT0=${CRT0}"
+          echo "=== Searching for elf_x86_64_efi.lds ==="
+          EFI_LDS=$(sudo find /usr -name "elf_x86_64_efi.lds" -print -quit)
+          echo "EFI_LDS=${EFI_LDS}"
+          if [ -z "${CRT0}" ] || [ -z "${EFI_LDS}" ]; then
+            echo "Required EFI toolchain files not found" >&2
+            exit 1
+          fi
+          EFILIB=$(dirname "${CRT0}")
+          echo "EFILIB=${EFILIB}"
+          echo "CRT0=${CRT0}"     >> $GITHUB_ENV
+          echo "EFI_LDS=${EFI_LDS}" >> $GITHUB_ENV
+          echo "EFILIB=${EFILIB}" >> $GITHUB_ENV
 
       - name: Build bootloader and kernel
         run: |
-          make
+          make CRT0="${CRT0}" EFI_LDS="${EFI_LDS}" EFILIB="${EFILIB}"
           echo "=== Build outputs ==="
           find build -maxdepth 4 -type f -print || true
 
@@ -39,26 +46,14 @@ jobs:
         run: |
           mkdir -p dist
           IMG=dist/lightos-uefi.img
-
-          # 64 MiB FAT32 image
           dd if=/dev/zero of="$IMG" bs=1M count=64
           mkfs.vfat -F 32 "$IMG"
-
-          # EFI directory structure
           mmd -i "$IMG" ::/EFI || true
           mmd -i "$IMG" ::/EFI/BOOT || true
-
-          # Copy bootloader
+          # UEFI bootloader
           mcopy -i "$IMG" build/EFI/BOOT/BOOTX64.EFI ::/EFI/BOOT/BOOTX64.EFI
-
-          # Copy kernel binary to root of volume
+          # Kernel image
           mcopy -i "$IMG" build/kernel.bin ::/kernel.bin
-
-          echo "=== Contents of image (FAT root) ==="
-          mdir -i "$IMG" ::
-
-          echo "=== Contents of /EFI/BOOT ==="
-          mdir -i "$IMG" ::/EFI/BOOT
 
       - name: Upload artifact (UEFI image)
         uses: actions/upload-artifact@v4
