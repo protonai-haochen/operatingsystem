@@ -16,6 +16,17 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y gcc make gnu-efi mtools dosfstools
 
+      - name: Locate EFI toolchain files
+        run: |
+          echo "=== Searching for crt0-efi-x86_64.o ==="
+          sudo find /usr -name "crt0-efi-x86_64.o" 2>/dev/null || true
+
+          echo "=== Searching for libefi ==="
+          sudo find /usr -name "libefi*" 2>/dev/null || true
+
+          echo "=== Searching for libgnuefi ==="
+          sudo find /usr -name "libgnuefi*" 2>/dev/null || true
+
       - name: Build BOOTX64.EFI
         run: |
           make
