@@ -41,18 +41,17 @@ static EFI_STATUS init_graphics(EFI_GRAPHICS_OUTPUT_PROTOCOL **Gop,
 }
 
 // ---------------------------------------------------------------------
-// Load kernel.bin from the same disk as this UEFI app
+// Open the filesystem root of the disk we were loaded from
+// This avoids LibOpenRoot and uses the raw FileSystemProtocol path that
+// gnu-efi examples use.
 // ---------------------------------------------------------------------
-static EFI_STATUS load_kernel(EFI_HANDLE ImageHandle,
-                              EFI_PHYSICAL_ADDRESS *KernelAddr,
-                              UINTN *KernelSize) {
+static EFI_STATUS open_root(EFI_HANDLE ImageHandle, EFI_FILE_HANDLE *Root) {
     EFI_STATUS Status;
-    EFI_LOADED_IMAGE *LoadedImage;
-    EFI_FILE_HANDLE Root;
-    EFI_FILE_HANDLE File;
+    EFI_LOADED_IMAGE       *LoadedImage;
+    EFI_FILE_IO_INTERFACE  *IOVolume;
 
     //
-    // 1) Get EFI_LOADED_IMAGE for our ImageHandle
+    // 1) Get EFI_LOADED_IMAGE for this image
     //
     Status = uefi_call_wrapper(BS->HandleProtocol, 3,
                                ImageHandle,
@@ -64,18 +63,49 @@ static EFI_STATUS load_kernel(EFI_HANDLE ImageHandle,
     }
 
     //
-    // 2) Open the filesystem root of the device we were loaded from.
-    //    IMPORTANT: use LoadedImage->DeviceHandle (this is what was wrong
-    //    in the older code that printed 'LibOpenRoot failed').
+    // 2) Get the FileSystemProtocol for the device we were loaded from
+    //    NOTE: GUID name here is FileSystemProtocol (this is what gnu-efi
+    //    actually defines; earlier we used LibOpenRoot which hides this).
     //
-    Status = LibOpenRoot(LoadedImage->DeviceHandle, &Root);
+    Status = uefi_call_wrapper(BS->HandleProtocol, 3,
+                               LoadedImage->DeviceHandle,
+                               &FileSystemProtocol,
+                               (VOID **)&IOVolume);
     if (EFI_ERROR(Status)) {
-        Print(L"[boot] LibOpenRoot failed: %r\r\n", Status);
+        Print(L"[boot] HandleProtocol(FileSystemProtocol) failed: %r\r\n", Status);
         return Status;
     }
 
     //
-    // 3) Open \kernel.bin from the root of that filesystem
+    // 3) Open the volume root
+    //
+    Status = uefi_call_wrapper(IOVolume->OpenVolume, 2, IOVolume, Root);
+    if (EFI_ERROR(Status)) {
+        Print(L"[boot] OpenVolume failed: %r\r\n", Status);
+        return Status;
+    }
+
+    return EFI_SUCCESS;
+}
+
+// ---------------------------------------------------------------------
+// Load \kernel.bin into memory at 0x00100000 and return pointer + size
+// ---------------------------------------------------------------------
+static EFI_STATUS load_kernel(EFI_HANDLE ImageHandle,
+                              EFI_PHYSICAL_ADDRESS *KernelAddr,
+                              UINTN *KernelSize) {
+    EFI_STATUS Status;
+    EFI_FILE_HANDLE Root;
+    EFI_FILE_HANDLE File;
+
+    Status = open_root(ImageHandle, &Root);
+    if (EFI_ERROR(Status)) {
+        Print(L"[boot] open_root failed: %r\r\n", Status);
+        return Status;
+    }
+
+    //
+    // kernel.bin is in the ROOT of the volume (FS0:\kernel.bin)
     //
     Status = uefi_call_wrapper(Root->Open, 5,
                                Root,
@@ -89,7 +119,7 @@ static EFI_STATUS load_kernel(EFI_HANDLE ImageHandle,
     }
 
     //
-    // 4) Allocate 1 MiB at physical 0x00100000 and read kernel.bin there
+    // Allocate 1 MiB at physical 1 MiB
     //
     EFI_PHYSICAL_ADDRESS Dest = 0x00100000;
     UINTN Pages = EFI_SIZE_TO_PAGES(1024 * 1024);
@@ -143,7 +173,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle,
     Status = init_graphics(&Gop, &bi);
     if (EFI_ERROR(Status)) {
         Print(L"[boot] init_graphics failed: %r\r\n", Status);
-        // We *could* continue in text mode, but for now just fall through.
+        // We could still continue in text mode, but for now just carry on.
     }
 
     EFI_PHYSICAL_ADDRESS KernelAddr = 0;
