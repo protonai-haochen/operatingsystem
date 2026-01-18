@@ -1,81 +1,110 @@
 #include <efi.h>
 #include <efilib.h>
 
-EFI_STATUS
-efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable) {
-    //
-    // Initialize UEFI Library
-    //
-    InitializeLib(ImageHandle, SystemTable);
-    Print(L"LightOS booting (UEFI mode)...\n");
+EFI_GRAPHICS_OUTPUT_PROTOCOL *gop;
+UINT32 ScreenWidth, ScreenHeight, Pitch;
+UINT8 *FrameBuffer;
 
-    //
-    // Locate the Graphics Output Protocol (GOP)
-    //
-    EFI_GUID gopGuid = EFI_GRAPHICS_OUTPUT_PROTOCOL_GUID;
-    EFI_GRAPHICS_OUTPUT_PROTOCOL *gop;
-    EFI_STATUS status;
+//
+// --- BASIC GRAPHICS API ---
+//
 
-    Print(L"Locating GOP...\n");
+void putpixel(UINT32 x, UINT32 y, UINT32 color) {
+    if (x >= ScreenWidth || y >= ScreenHeight) return;
+    UINT32 *pixel = (UINT32 *)(FrameBuffer + (x + y * Pitch) * 4);
+    *pixel = color;
+}
 
-    status = uefi_call_wrapper(
-        SystemTable->BootServices->LocateProtocol,
-        3,
-        &gopGuid,
-        NULL,
-        (void **)&gop
-    );
-
-    if (EFI_ERROR(status)) {
-        Print(L"[ERROR] Could not locate GOP: %r\n", status);
-        return status;
-    }
-
-    //
-    // Use the default graphics mode (Mode 0)
-    //
-    Print(L"GOP located. Switching to graphics mode...\n");
-
-    status = uefi_call_wrapper(gop->SetMode, 2, gop, 0);
-    if (EFI_ERROR(status)) {
-        Print(L"[ERROR] SetMode failed: %r\n", status);
-        return status;
-    }
-
-    //
-    // Retrieve framebuffer information
-    //
-    UINT8  *fb     = (UINT8 *) gop->Mode->FrameBufferBase;
-    UINT32 width   = gop->Mode->Info->HorizontalResolution;
-    UINT32 height  = gop->Mode->Info->VerticalResolution;
-    UINT32 pitch   = gop->Mode->Info->PixelsPerScanLine;
-
-    Print(L"Graphics Mode: %dx%d\n", width, height);
-
-    //
-    // Simple GUI test — fill the entire screen with blue
-    //
-    Print(L"Drawing GUI background...\n");
-
-    for (UINT32 y = 0; y < height; y++) {
-        for (UINT32 x = 0; x < width; x++) {
-
-            UINT32 *pixel = (UINT32 *)(fb + (x + y * pitch) * 4);
-
-            UINT8 blue  = 255;
-            UINT8 green = 0;
-            UINT8 red   = 0;
-
-            *pixel = (blue) | (green << 8) | (red << 16);
+void fill_rect(UINT32 x, UINT32 y, UINT32 w, UINT32 h, UINT32 color) {
+    for (UINT32 iy = 0; iy < h; iy++) {
+        for (UINT32 ix = 0; ix < w; ix++) {
+            putpixel(x + ix, y + iy, color);
         }
     }
+}
 
-    Print(L"LightOS GUI initialized.\n");
+void draw_rect(UINT32 x, UINT32 y, UINT32 w, UINT32 h, UINT32 color) {
+    // top
+    for (UINT32 i = 0; i < w; i++) putpixel(x + i, y, color);
+    // bottom
+    for (UINT32 i = 0; i < w; i++) putpixel(x + i, y + h - 1, color);
+    // left
+    for (UINT32 i = 0; i < h; i++) putpixel(x, y + i, color);
+    // right
+    for (UINT32 i = 0; i < h; i++) putpixel(x + w - 1, y + i, color);
+}
 
-    //
-    // Freeze the screen (UEFI apps exit instantly otherwise)
-    //
+//
+// --- DRAW CHROMEOS-LIKE WINDOW ---
+//
+
+void draw_window(UINT32 x, UINT32 y, UINT32 w, UINT32 h) {
+
+    UINT32 border = 0xFFCCCCCC;      // light gray border
+    UINT32 bg     = 0xFFFFFFFF;      // white window background
+    UINT32 title  = 0xFFEFEFEF;      // light gray title bar (flat, no rounding)
+    UINT32 shadow = 0x22000000;      // faint drop shadow
+
+    // Draw shadow (ChromeOS style: subtle rectangular shadow)
+    fill_rect(x + 4, y + 4, w, h, shadow);
+
+    // Draw window background
+    fill_rect(x, y, w, h, bg);
+
+    // Draw title bar (no rounded corners – square)
+    fill_rect(x, y, w, 28, title);
+
+    // Draw border
+    draw_rect(x, y, w, h, border);
+
+    // Draw title text (EFI text mode, not yet rendered in framebuffer)
+    // TODO: later we add custom bitmap font rendering
+    Print(L"[LightOS] Demo Window Drawn.\n");
+}
+
+//
+// --- ENTRY POINT ---
+//
+
+EFI_STATUS efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable) {
+    InitializeLib(ImageHandle, SystemTable);
+    Print(L"LightOS GUI Boot...\n");
+
+    EFI_GUID gopGuid = EFI_GRAPHICS_OUTPUT_PROTOCOL_GUID;
+    EFI_STATUS status = uefi_call_wrapper(
+        SystemTable->BootServices->LocateProtocol,
+        3, &gopGuid, NULL, (void**)&gop
+    );
+    if (EFI_ERROR(status)) {
+        Print(L"Could not load GOP: %r\n", status);
+        return status;
+    }
+
+    // Set graphics mode 0 (safe)
+    uefi_call_wrapper(gop->SetMode, 2, gop, 0);
+
+    // Load screen info
+    FrameBuffer = (UINT8*)gop->Mode->FrameBufferBase;
+    ScreenWidth = gop->Mode->Info->HorizontalResolution;
+    ScreenHeight = gop->Mode->Info->VerticalResolution;
+    Pitch = gop->Mode->Info->PixelsPerScanLine;
+
+    // Fill background (ChromeOS blue-ish gray)
+    fill_rect(0, 0, ScreenWidth, ScreenHeight, 0xFFE5ECF4);
+
+    // Draw taskbar (ChromeOS style)
+    fill_rect(0, ScreenHeight - 48, ScreenWidth, 48, 0xFFFFFFFF);
+
+    // Draw demo window centered
+    UINT32 winW = 600;
+    UINT32 winH = 400;
+    UINT32 winX = (ScreenWidth - winW) / 2;
+    UINT32 winY = (ScreenHeight - winH) / 2 - 20;
+
+    draw_window(winX, winY, winW, winH);
+
+    Print(L"GUI initialized.\n");
+
     while (1);
-
     return EFI_SUCCESS;
 }
