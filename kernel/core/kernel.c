@@ -1,21 +1,34 @@
 #include <stdint.h>
-#include "boot.h"
 
-void kernel_main(BootInfo *boot) {
-    uint32_t *fb = (uint32_t*)boot->framebuffer_base;
-    uint32_t width  = boot->framebuffer_width;
-    uint32_t height = boot->framebuffer_height;
-    uint32_t pitch  = boot->framebuffer_pitch;
+static inline void hlt(void) {
+    __asm__ __volatile__("hlt");
+}
 
-    // Fill screen with dark blue to prove the KERNEL is drawing, not UEFI
-    for (uint32_t y = 0; y < height; y++) {
-        for (uint32_t x = 0; x < width; x++) {
-            fb[x + y * pitch] = 0x00002080;  // dark-ish blue
+// Very tiny test kernel: draw a gradient and halt.
+void kernel_main(uint64_t fb_base,
+                 uint32_t width,
+                 uint32_t height,
+                 uint32_t pitch)
+{
+    uint32_t *fb = (uint32_t *)fb_base;
+
+    for (uint32_t y = 0; y < height; ++y) {
+        for (uint32_t x = 0; x < width; ++x) {
+            uint8_t r = (x * 255) / (width  ? width  : 1);
+            uint8_t g = (y * 255) / (height ? height : 1);
+            uint8_t b = 64;
+
+            uint32_t color =
+                ((uint32_t)r << 16) |
+                ((uint32_t)g << 8)  |
+                ((uint32_t)b);
+
+            fb[y * pitch + x] = color;
         }
     }
 
-    // Simple halt loop so CPU doesn't run wild
-    while (1) {
-        __asm__ __volatile__("hlt");
+    // Hang the CPU so the screen stays put.
+    for (;;) {
+        hlt();
     }
 }
