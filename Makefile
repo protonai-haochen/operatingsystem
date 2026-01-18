@@ -1,83 +1,79 @@
 ARCH := x86_64
-
 EFI_TARGET := BOOTX64.EFI
-KERNEL_ELF := build/kernel.elf
-KERNEL_BIN := build/kernel.bin
 
 CC      := gcc
 LD      := ld
 OBJCOPY := objcopy
 
-# UEFI headers
-EFI_INC ?= /usr/include/efi
+BUILD_DIR := build
+EFI_DIR   := $(BUILD_DIR)/EFI/BOOT
 
-# These are filled in by the GitHub Actions workflow,
-# but we provide sane defaults for local builds.
+# These are discovered in the GitHub Actions workflow,
+# but we set defaults so local builds don't explode.
 CRT0    ?= /usr/lib/crt0-efi-$(ARCH).o
 EFI_LDS ?= /usr/lib/elf_$(ARCH)_efi.lds
 EFILIB  ?= /usr/lib
 
-CFLAGS_COMMON := -ffreestanding -fno-stack-protector -fno-pic -mno-red-zone \
-                 -Wall -Wextra -O2
+# --------------------------------------------------------------------
+# UEFI bootloader flags  (MUST be PIC, NOT freestanding)
+# --------------------------------------------------------------------
+UEFI_CFLAGS := -I/usr/include/efi -I/usr/include/efi/$(ARCH) \
+               -fno-stack-protector -fpic -fshort-wchar -mno-red-zone \
+               -DEFI_FUNCTION_WRAPPER -Wall -Wextra -O2
 
-EFI_CFLAGS := $(CFLAGS_COMMON) \
-              -fshort-wchar \
-              -I$(EFI_INC) -I$(EFI_INC)/$(ARCH) \
-              -DEFI_FUNCTION_WRAPPER
+UEFI_LDFLAGS := -nostdlib -znocombreloc -T $(EFI_LDS)
+UEFI_LIBS    := -L$(EFILIB) -lefi -lgnuefi
 
-KERNEL_CFLAGS := $(CFLAGS_COMMON) -m64 -Ikernel/include
+# --------------------------------------------------------------------
+# Kernel flags  (REAL freestanding kernel code)
+# --------------------------------------------------------------------
+KERNEL_CFLAGS := -ffreestanding -fno-stack-protector -mno-red-zone -m64 \
+                 -Wall -Wextra -O2 -Ikernel/include
 
-LIBGCC := $(shell $(CC) $(EFI_CFLAGS) -print-libgcc-file-name 2>/dev/null)
+KERNEL_LDFLAGS := -nostdlib -z max-page-size=0x1000 -T kernel/link.ld
 
-EFI_LDFLAGS := -nostdlib -znocombreloc -T $(EFI_LDS)
-EFI_LIBS    := -L$(EFILIB) -lefi -lgnuefi $(LIBGCC)
+# --------------------------------------------------------------------
+# Top-level targets
+# --------------------------------------------------------------------
+all: $(EFI_DIR)/$(EFI_TARGET) $(BUILD_DIR)/kernel.bin
 
-KERNEL_LDFLAGS := -nostdlib -z max-page-size=0x1000
+$(BUILD_DIR):
+	mkdir -p $(BUILD_DIR)
 
-BUILD_DIR := build
-EFI_DIR   := $(BUILD_DIR)/EFI/BOOT
-
-all: $(EFI_DIR)/$(EFI_TARGET) $(KERNEL_BIN)
-
-# -----------------------
-# UEFI bootloader
-# -----------------------
-
-$(EFI_DIR)/$(EFI_TARGET): $(BUILD_DIR)/bootloader.elf
+$(EFI_DIR): | $(BUILD_DIR)
 	mkdir -p $(EFI_DIR)
+
+# ========================= UEFI BOOTLOADER =========================
+
+$(BUILD_DIR)/bootloader.o: uefi/main.c | $(BUILD_DIR)
+	$(CC) $(UEFI_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/bootloader.elf: $(BUILD_DIR)/bootloader.o
+	$(LD) $(UEFI_LDFLAGS) $(CRT0) $< \
+	    -shared -Bsymbolic \
+	    $(UEFI_LIBS) \
+	    -o $@
+
+$(EFI_DIR)/$(EFI_TARGET): $(BUILD_DIR)/bootloader.elf | $(EFI_DIR)
 	$(OBJCOPY) \
 	    -j .text -j .sdata -j .data -j .dynamic -j .dynsym \
 	    -j .rel -j .rela -j .reloc \
 	    --target=efi-app-$(ARCH) \
 	    $< $@
 
-$(BUILD_DIR)/bootloader.elf: $(BUILD_DIR)/bootloader.o
-	mkdir -p $(BUILD_DIR)
-	$(LD) $(EFI_LDFLAGS) $(CRT0) $< \
-	    -shared -Bsymbolic \
-	    $(EFI_LIBS) \
-	    -o $@
+# ============================= KERNEL ==============================
 
-$(BUILD_DIR)/bootloader.o: uefi/main.c
-	mkdir -p $(BUILD_DIR)
-	$(CC) $(EFI_CFLAGS) -c $< -o $@
-
-# -----------------------
-# Kernel
-# -----------------------
-
-$(KERNEL_BIN): $(KERNEL_ELF)
-	$(OBJCOPY) -O binary $< $@
-
-$(KERNEL_ELF): $(BUILD_DIR)/kernel.o kernel/link.ld
-	mkdir -p $(BUILD_DIR)
-	$(LD) $(KERNEL_LDFLAGS) -T kernel/link.ld $< -o $@
-
-$(BUILD_DIR)/kernel.o: kernel/core/kernel.c
-	mkdir -p $(BUILD_DIR)
+$(BUILD_DIR)/kernel.o: kernel/core/kernel.c | $(BUILD_DIR)
 	$(CC) $(KERNEL_CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/kernel.elf: $(BUILD_DIR)/kernel.o kernel/link.ld
+	$(LD) $(KERNEL_LDFLAGS) -o $@ $<
+
+$(BUILD_DIR)/kernel.bin: $(BUILD_DIR)/kernel.elf
+	$(OBJCOPY) -O binary $< $@
 
 clean:
 	rm -rf $(BUILD_DIR)
 
 .PHONY: all clean
+
