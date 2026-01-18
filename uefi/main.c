@@ -1,201 +1,129 @@
 #include <efi.h>
 #include <efilib.h>
-#include "../kernel/include/boot.h"
 
-typedef void (*KernelEntry)(BootInfo *boot_info);
+// Kernel entrypoint type.
+// fb_base: physical framebuffer base address
+// width/height: resolution
+// pitch: pixels per scan line
+typedef void (*KernelEntry)(
+    UINT64 fb_base,
+    UINT32 width,
+    UINT32 height,
+    UINT32 pitch
+);
 
-EFI_STATUS
-efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable) {
-    InitializeLib(ImageHandle, SystemTable);
-    Print(L"LightOS UEFI Bootloader\n");
-
+// Load "kernel.bin" into the provided buffer.
+static EFI_STATUS load_kernel(EFI_HANDLE ImageHandle,
+                              VOID *buffer,
+                              UINTN buffer_size,
+                              UINTN *bytes_read)
+{
     EFI_STATUS status;
+    EFI_FILE_HANDLE root = NULL;
+    EFI_FILE_HANDLE file = NULL;
 
-    //
-    // 1. Locate GOP (graphics output) so we can hand framebuffer to kernel
-    //
-    EFI_GUID gopGuid = EFI_GRAPHICS_OUTPUT_PROTOCOL_GUID;
-    EFI_GRAPHICS_OUTPUT_PROTOCOL *gop = NULL;
-
-    status = uefi_call_wrapper(
-        SystemTable->BootServices->LocateProtocol,
-        3,
-        &gopGuid,
-        NULL,
-        (void**)&gop
-    );
-    if (EFI_ERROR(status) || gop == NULL) {
-        Print(L"[BOOT] Failed to locate GOP: %r\n", status);
-        return status;
+    root = LibOpenRoot(ImageHandle);
+    if (root == NULL) {
+        Print(L"[boot] LibOpenRoot failed\r\n");
+        return EFI_NOT_FOUND;
     }
 
-    UINT32 width  = gop->Mode->Info->HorizontalResolution;
-    UINT32 height = gop->Mode->Info->VerticalResolution;
-    UINT32 pitch  = gop->Mode->Info->PixelsPerScanLine;
-    EFI_PHYSICAL_ADDRESS fb_base = gop->Mode->FrameBufferBase;
-
-    Print(L"[BOOT] GOP: %d x %d, pitch=%d\n", width, height, pitch);
-
-    //
-    // 2. Open filesystem root
-    //
-    EFI_FILE_HANDLE root = LibOpenRoot(ImageHandle);
-    if (!root) {
-        Print(L"[BOOT] Failed to open filesystem root\n");
-        return EFI_LOAD_ERROR;
-    }
-
-    //
-    // 3. Open kernel.bin from the volume root
-    //
-    EFI_FILE_HANDLE kernelFile;
     status = uefi_call_wrapper(
         root->Open,
         5,
         root,
-        &kernelFile,
+        &file,
         L"kernel.bin",
         EFI_FILE_MODE_READ,
         0
     );
     if (EFI_ERROR(status)) {
-        Print(L"[BOOT] Failed to open kernel.bin: %r\n", status);
+        Print(L"[boot] Unable to open kernel.bin: %r\r\n", status);
         return status;
     }
 
-    //
-    // 4. Get kernel file size
-    //
-    EFI_FILE_INFO *info = LibFileInfo(kernelFile);
-    if (!info) {
-        Print(L"[BOOT] LibFileInfo failed\n");
-        kernelFile->Close(kernelFile);
-        return EFI_LOAD_ERROR;
-    }
-
-    UINTN kernelSize = info->FileSize;
-    Print(L"[BOOT] kernel.bin size: %d bytes\n", (UINT32)kernelSize);
-    FreePool(info);
-
-    //
-    // 5. Allocate memory for kernel at 1 MiB (0x100000)
-    //
-    EFI_PHYSICAL_ADDRESS kernel_addr = 0x100000;
-    UINTN pages = (kernelSize + 0xFFF) / 0x1000;
-
+    *bytes_read = buffer_size;
     status = uefi_call_wrapper(
-        SystemTable->BootServices->AllocatePages,
-        4,
-        AllocateAddress,
-        EfiLoaderData,
-        pages,
-        &kernel_addr
-    );
-    if (EFI_ERROR(status)) {
-        Print(L"[BOOT] AllocatePages failed: %r\n", status);
-        kernelFile->Close(kernelFile);
-        return status;
-    }
-
-    //
-    // 6. Read kernel into memory
-    //
-    UINTN readSize = kernelSize;
-    status = uefi_call_wrapper(
-        kernelFile->Read,
+        file->Read,
         3,
-        kernelFile,
-        &readSize,
-        (void*)kernel_addr
-    );
-    kernelFile->Close(kernelFile);
-
-    if (EFI_ERROR(status) || readSize != kernelSize) {
-        Print(L"[BOOT] Read kernel.bin failed: %r (read %d bytes)\n",
-              status, (UINT32)readSize);
-        return status;
-    }
-
-    Print(L"[BOOT] Kernel loaded at 0x%x (%d pages)\n",
-          (UINTN)kernel_addr, (UINT32)pages);
-
-    //
-    // 7. Build BootInfo struct for the kernel
-    //
-    BootInfo boot;
-    boot.framebuffer_base   = (uint64_t)fb_base;
-    boot.framebuffer_width  = width;
-    boot.framebuffer_height = height;
-    boot.framebuffer_pitch  = pitch;
-
-    //
-    // 8. Get memory map, then ExitBootServices (UEFI is gone after this)
-    //
-    UINTN mmapSize = 0;
-    EFI_MEMORY_DESCRIPTOR *mmap = NULL;
-    UINTN mapKey;
-    UINTN descSize;
-    UINT32 descVersion;
-
-    status = uefi_call_wrapper(
-        SystemTable->BootServices->GetMemoryMap,
-        5,
-        &mmapSize,
-        mmap,
-        &mapKey,
-        &descSize,
-        &descVersion
+        file,
+        bytes_read,
+        buffer
     );
 
-    if (status == EFI_BUFFER_TOO_SMALL) {
-        mmapSize += descSize * 2;
-        status = uefi_call_wrapper(
-            SystemTable->BootServices->AllocatePool,
-            3,
-            EfiLoaderData,
-            mmapSize,
-            (void**)&mmap
-        );
-        if (EFI_ERROR(status)) {
-            Print(L"[BOOT] AllocatePool for memory map failed: %r\n", status);
-            return status;
-        }
-
-        status = uefi_call_wrapper(
-            SystemTable->BootServices->GetMemoryMap,
-            5,
-            &mmapSize,
-            mmap,
-            &mapKey,
-            &descSize,
-            &descVersion
-        );
-    }
+    uefi_call_wrapper(file->Close, 1, file);
 
     if (EFI_ERROR(status)) {
-        Print(L"[BOOT] GetMemoryMap failed: %r\n", status);
+        Print(L"[boot] Failed to read kernel.bin: %r\r\n", status);
         return status;
     }
-
-    status = uefi_call_wrapper(
-        SystemTable->BootServices->ExitBootServices,
-        2,
-        ImageHandle,
-        mapKey
-    );
-    if (EFI_ERROR(status)) {
-        // Proper retry logic is a bit more work; for now we just bail.
-        return status;
-    }
-
-    //
-    // 9. Jump to kernel entry point at 1 MiB
-    //
-    KernelEntry entry = (KernelEntry)( (UINTN)kernel_addr );
-    entry(&boot);
-
-    // Should never return
-    while (1) { }
 
     return EFI_SUCCESS;
+}
+
+EFI_STATUS
+efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
+{
+    InitializeLib(ImageHandle, SystemTable);
+    Print(L"LightOS UEFI bootloader starting...\r\n");
+
+    // --- Locate GOP (graphics) ---
+    EFI_STATUS status;
+    EFI_GUID gopGuid = EFI_GRAPHICS_OUTPUT_PROTOCOL_GUID;
+    EFI_GRAPHICS_OUTPUT_PROTOCOL *gop = NULL;
+
+    status = uefi_call_wrapper(
+        BS->LocateProtocol,
+        3,
+        &gopGuid,
+        NULL,
+        (VOID **)&gop
+    );
+    if (EFI_ERROR(status) || gop == NULL) {
+        Print(L"[boot] Unable to locate GOP: %r\r\n", status);
+        return status;
+    }
+
+    UINT64 fb_base = gop->Mode->FrameBufferBase;
+    UINT32 width   = gop->Mode->Info->HorizontalResolution;
+    UINT32 height  = gop->Mode->Info->VerticalResolution;
+    UINT32 pitch   = gop->Mode->Info->PixelsPerScanLine;
+
+    Print(L"[boot] Framebuffer @ 0x%lx (%ux%u, pitch %u)\r\n",
+          fb_base, width, height, pitch);
+
+    // --- Load kernel.bin into memory ---
+    const UINTN kernel_max_size = 2 * 1024 * 1024; // 2 MiB
+    VOID *kernel_buffer = AllocatePool(kernel_max_size);
+    if (kernel_buffer == NULL) {
+        Print(L"[boot] Failed to allocate kernel buffer\r\n");
+        return EFI_OUT_OF_RESOURCES;
+    }
+
+    UINTN kernel_size = 0;
+    status = load_kernel(ImageHandle, kernel_buffer, kernel_max_size, &kernel_size);
+    if (EFI_ERROR(status)) {
+        Print(L"[boot] load_kernel failed: %r\r\n", status);
+        FreePool(kernel_buffer);
+        return status;
+    }
+
+    Print(L"[boot] Loaded kernel.bin (%lu bytes) at 0x%lx\r\n",
+          (UINT64)kernel_size, (UINT64)kernel_buffer);
+
+    // --- Jump to kernel ---
+    KernelEntry entry = (KernelEntry)kernel_buffer;
+    Print(L"[boot] Jumping to kernel...\r\n");
+
+    // For now we *do not* call ExitBootServices; this is enough to
+    // play with the framebuffer and prove the kernel runs.
+    entry(fb_base, width, height, pitch);
+
+    // If the kernel ever returns, just hang.
+    Print(L"[boot] Kernel returned, halting.\r\n");
+    for (;;) {
+        // spin
+    }
+
+    return EFI_SUCCESS; // not actually reached
 }
