@@ -1,16 +1,12 @@
 #include <efi.h>
 #include <efilib.h>
+#include <boot.h>  // shared BootInfo definition
 
 #define KERNEL_PATH      L"\\kernel.bin"
 #define KERNEL_LOAD_ADDR 0x00100000ULL
 
 // Kernel entry: must match kernel/core/kernel.c
-typedef void (*kernel_entry_t)(
-    UINT64 fb_base,
-    UINT32 width,
-    UINT32 height,
-    UINT32 pitch
-);
+typedef void (*kernel_entry_t)(BootInfo *bi);
 
 EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable) {
     InitializeLib(ImageHandle, SystemTable);
@@ -116,7 +112,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     Print(L"[boot] kernel.bin loaded at 0x%lx (%lu bytes)\r\n",
           (UINT64)KERNEL_LOAD_ADDR, KernelSize);
 
-    // We’re done with the file handles.
+    // Done with files
     uefi_call_wrapper(KernelFile->Close, 1, KernelFile);
     uefi_call_wrapper(Volume->Close, 1, Volume);
 
@@ -133,23 +129,31 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
         return Status;
     }
 
-    UINT64 fb_base  = Gop->Mode->FrameBufferBase;
-    UINT32 fb_width = Gop->Mode->Info->HorizontalResolution;
+    UINT64 fb_base   = Gop->Mode->FrameBufferBase;
+    UINT32 fb_width  = Gop->Mode->Info->HorizontalResolution;
     UINT32 fb_height = Gop->Mode->Info->VerticalResolution;
-    UINT32 fb_pitch = Gop->Mode->Info->PixelsPerScanLine;
+    UINT32 fb_pitch  = Gop->Mode->Info->PixelsPerScanLine;
 
     Print(L"[boot] Framebuffer @ 0x%lx (%ux%u, pitch %u)\r\n",
           fb_base, fb_width, fb_height, fb_pitch);
 
-    // --- 7. Jump to kernel entry point ---
+    // --- 7. Prepare BootInfo for the kernel ---
+    BootInfo bi;
+    bi.framebuffer_base   = fb_base;
+    bi.framebuffer_width  = fb_width;
+    bi.framebuffer_height = fb_height;
+    bi.framebuffer_pitch  = fb_pitch;
+
+    // --- 8. Jump to kernel entry point ---
     kernel_entry_t entry = (kernel_entry_t)(UINTN)KERNEL_LOAD_ADDR;
 
     Print(L"[boot] Jumping to kernel at 0x%lx\r\n", (UINT64)KERNEL_LOAD_ADDR);
 
-    // Call into your kernel. This should NOT return in normal operation.
-    entry(fb_base, fb_width, fb_height, fb_pitch);
+    // Call into your kernel. This should NOT return.
+    entry(&bi);
 
     // If we get here, kernel actually returned.
     Print(L"[boot] Kernel returned, halting.\r\n");
     return EFI_SUCCESS;
 }
+
