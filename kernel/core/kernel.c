@@ -407,7 +407,7 @@ static void draw_desktop(void) {
 
 // Kernel entry -------------------------------------------------------
 
-__attribute__((noreturn))
+__attribute__((noreturn, section(".entry")))
 void kernel_main(BootInfo *bi) {
     g_fb     = (uint32_t *)(uintptr_t)bi->framebuffer_base;
     g_width  = bi->framebuffer_width;
