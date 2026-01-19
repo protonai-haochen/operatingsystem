@@ -1,6 +1,6 @@
-// LightOS 4 kernel
-// Simple UEFI framebuffer desktop + Command Block shell.
-// Uses BootInfo from boot.h and PS/2 keyboard polling.
+// LightOS 4 kernel - revised full version
+// Framebuffer desktop + Command Block shell.
+// No mouse, no real filesystem yet.
 
 #include <stdint.h>
 #include "boot.h"
@@ -15,7 +15,7 @@ static uint32_t  g_height = 0;
 static uint32_t  g_pitch  = 0;   // pixels per scanline
 
 // ---------------------------------------------------------------------
-// Low-level I/O / keyboard
+// CPU / I/O helpers
 // ---------------------------------------------------------------------
 
 static inline uint8_t inb(uint16_t port) {
@@ -24,275 +24,446 @@ static inline uint8_t inb(uint16_t port) {
     return value;
 }
 
-static inline void outb(uint16_t port, uint8_t value) {
-    __asm__ volatile("outb %0, %1" : : "a"(value), "Nd"(port));
-}
-
-// Simple polling PS/2 keyboard
-static int keyboard_poll(uint8_t *scancode) {
-    if (inb(0x64) & 0x01) {
-        *scancode = inb(0x60);
-        return 1;
-    }
-    return 0;
+// Non-blocking PS/2 keyboard poll.
+// Returns 1 if a scancode was read into *sc, 0 if none.
+static int keyboard_poll(uint8_t *sc) {
+    uint8_t status = inb(0x64);
+    if ((status & 0x01) == 0)
+        return 0;
+    *sc = inb(0x60);
+    return 1;
 }
 
 // ---------------------------------------------------------------------
-// Basic drawing helpers
+// Drawing primitives
 // ---------------------------------------------------------------------
 
 static inline void put_pixel(uint32_t x, uint32_t y, uint32_t color) {
     if (x >= g_width || y >= g_height) return;
-    uint32_t *row = (uint32_t*)((uint8_t*)g_fb + y * g_pitch * 4);
-    row[x] = color;
+    g_fb[(uint64_t)y * g_pitch + x] = color;
 }
 
-static void fill_rect(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t color) {
-    for (uint32_t yy = 0; yy < h; ++yy) {
-        if (y + yy >= g_height) break;
-        uint32_t *row = (uint32_t*)((uint8_t*)g_fb + (y + yy) * g_pitch * 4);
-        for (uint32_t xx = 0; xx < w && x + xx < g_width; ++xx) {
-            row[x + xx] = color;
+static void fill_rect(uint32_t x, uint32_t y,
+                      uint32_t w, uint32_t h,
+                      uint32_t color) {
+    if (x >= g_width || y >= g_height) return;
+
+    uint32_t max_x = x + w;
+    uint32_t max_y = y + h;
+    if (max_x > g_width)  max_x = g_width;
+    if (max_y > g_height) max_y = g_height;
+
+    for (uint32_t yy = y; yy < max_y; ++yy) {
+        uint32_t *row = g_fb + (uint64_t)yy * g_pitch;
+        for (uint32_t xx = x; xx < max_x; ++xx) {
+            row[xx] = color;
         }
     }
 }
 
-// 8x8 bitmap font (ASCII 32..127) – same as before (not shown fully here
-// in this comment; keep your existing font table).
+static void fill_circle(uint32_t cx, uint32_t cy, uint32_t r, uint32_t color) {
+    for (int32_t y = -(int32_t)r; y <= (int32_t)r; ++y) {
+        for (int32_t x = -(int32_t)r; x <= (int32_t)r; ++x) {
+            if (x * x + y * y <= (int32_t)r * (int32_t)r) {
+                uint32_t px = (uint32_t)((int32_t)cx + x);
+                uint32_t py = (uint32_t)((int32_t)cy + y);
+                put_pixel(px, py, color);
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------
-//  ... (keep your existing font bitmap data / font table here)
+// Tiny 8x8 bitmap font for a subset of ASCII (enough for our UI)
 // ---------------------------------------------------------------------
 
-extern const uint8_t g_font[96][8];  // from your existing font.c / data
+typedef struct {
+    char c;
+    uint8_t rows[8];
+} Glyph8;
 
-static void draw_char(uint32_t x, uint32_t y, char c, uint32_t fg, uint32_t bg, uint32_t scale) {
-    if (c < 32 || c > 127) return;
-    const uint8_t *glyph = g_font[(uint8_t)c - 32];
+static const Glyph8 FONT8[] = {
+    // Basic letters used in UI text
+    { 'A', { 0b00011000,
+             0b00100100,
+             0b01000010,
+             0b01111110,
+             0b01000010,
+             0b01000010,
+             0b00000000,
+             0 } },
+    { 'B', { 0b01111100,
+             0b01000010,
+             0b01111100,
+             0b01000010,
+             0b01000010,
+             0b01111100,
+             0,
+             0 } },
+    { 'C', { 0b00111100,
+             0b01000010,
+             0b01000000,
+             0b01000000,
+             0b01000010,
+             0b00111100,
+             0,
+             0 } },
+    { 'D', { 0b01111000,
+             0b01000100,
+             0b01000010,
+             0b01000010,
+             0b01000100,
+             0b01111000,
+             0,
+             0 } },
+    { 'E', { 0b01111110,
+             0b01000000,
+             0b01111100,
+             0b01000000,
+             0b01000000,
+             0b01111110,
+             0,
+             0 } },
+    { 'G', { 0b00111100,
+             0b01000010,
+             0b01000000,
+             0b01001110,
+             0b01000010,
+             0b00111100,
+             0,
+             0 } },
+    { 'H', { 0b01000010,
+             0b01000010,
+             0b01111110,
+             0b01000010,
+             0b01000010,
+             0b01000010,
+             0,
+             0 } },
+    { 'I', { 0b00111100,
+             0b00011000,
+             0b00011000,
+             0b00011000,
+             0b00011000,
+             0b00111100,
+             0,
+             0 } },
+    { 'L', { 0b01000000,
+             0b01000000,
+             0b01000000,
+             0b01000000,
+             0b01000000,
+             0b01111110,
+             0,
+             0 } },
+    { 'M', { 0b01000010,
+             0b01100110,
+             0b01011010,
+             0b01000010,
+             0b01000010,
+             0b01000010,
+             0,
+             0 } },
+    { 'N', { 0b01000010,
+             0b01100010,
+             0b01010010,
+             0b01001010,
+             0b01000110,
+             0b01000010,
+             0,
+             0 } },
+    { 'O', { 0b00111100,
+             0b01000010,
+             0b01000010,
+             0b01000010,
+             0b01000010,
+             0b00111100,
+             0,
+             0 } },
+    { 'R', { 0b01111100,
+             0b01000010,
+             0b01111100,
+             0b01001000,
+             0b01000100,
+             0b01000010,
+             0,
+             0 } },
+    { 'S', { 0b00111100,
+             0b01000000,
+             0b00111100,
+             0b00000010,
+             0b00000010,
+             0b00111100,
+             0,
+             0 } },
+    { 'T', { 0b01111110,
+             0b00011000,
+             0b00011000,
+             0b00011000,
+             0b00011000,
+             0b00011000,
+             0,
+             0 } },
+    { 'U', { 0b01000010,
+             0b01000010,
+             0b01000010,
+             0b01000010,
+             0b01000010,
+             0b00111100,
+             0,
+             0 } },
+    { 'V', { 0b01000010,
+             0b01000010,
+             0b01000010,
+             0b00100100,
+             0b00100100,
+             0b00011000,
+             0,
+             0 } },
+    { 'Y', { 0b01000010,
+             0b00100100,
+             0b00011000,
+             0b00011000,
+             0b00011000,
+             0b00011000,
+             0,
+             0 } },
+    { '0', { 0b00111100,
+             0b01000010,
+             0b01000010,
+             0b01000010,
+             0b01000010,
+             0b00111100,
+             0,
+             0 } },
+    { '1', { 0b00011000,
+             0b00101000,
+             0b00001000,
+             0b00001000,
+             0b00001000,
+             0b00111100,
+             0,
+             0 } },
+    { '2', { 0b00111100,
+             0b01000010,
+             0b00000100,
+             0b00011000,
+             0b00100000,
+             0b01111110,
+             0,
+             0 } },
+    { '3', { 0b00111100,
+             0b01000010,
+             0b00000100,
+             0b00011100,
+             0b01000010,
+             0b00111100,
+             0,
+             0 } },
+    { '4', { 0b00001100,
+             0b00010100,
+             0b00100100,
+             0b01000100,
+             0b01111110,
+             0b00000100,
+             0,
+             0 } },
+    { '5', { 0b01111110,
+             0b01000000,
+             0b01111100,
+             0b00000010,
+             0b00000010,
+             0b01111100,
+             0,
+             0 } },
+    { '6', { 0b00111100,
+             0b01000000,
+             0b01111100,
+             0b01000010,
+             0b01000010,
+             0b00111100,
+             0,
+             0 } },
+    { '7', { 0b01111110,
+             0b00000010,
+             0b00000100,
+             0b00001000,
+             0b00010000,
+             0b00010000,
+             0,
+             0 } },
+    { '8', { 0b00111100,
+             0b01000010,
+             0b00111100,
+             0b01000010,
+             0b01000010,
+             0b00111100,
+             0,
+             0 } },
+    { '9', { 0b00111100,
+             0b01000010,
+             0b01000010,
+             0b00111110,
+             0b00000010,
+             0b00111100,
+             0,
+             0 } },
+    { ':', { 0b00000000,
+             0b00011000,
+             0b00011000,
+             0b00000000,
+             0b00011000,
+             0b00011000,
+             0,
+             0 } },
+    { '-', { 0b00000000,
+             0b00000000,
+             0b00000000,
+             0b01111110,
+             0b00000000,
+             0b00000000,
+             0,
+             0 } },
+    { ' ', { 0,0,0,0,0,0,0,0 } },
+};
 
-    for (uint32_t cy = 0; cy < 8; ++cy) {
-        uint8_t row = glyph[cy];
-        for (uint32_t cx = 0; cx < 8; ++cx) {
-            uint32_t color = (row & (1u << (7 - cx))) ? fg : bg;
-            if (color == 0xFFFFFFFF) continue; // treat white as transparent bg
-            for (uint32_t sy = 0; sy < scale; ++sy) {
-                for (uint32_t sx = 0; sx < scale; ++sx) {
-                    put_pixel(x + cx * scale + sx, y + cy * scale + sy, color);
+static const uint8_t *font_lookup(char c) {
+    for (unsigned i = 0; i < sizeof(FONT8)/sizeof(FONT8[0]); ++i) {
+        if (FONT8[i].c == c) return FONT8[i].rows;
+    }
+    // default to space
+    return FONT8[sizeof(FONT8)/sizeof(FONT8[0]) - 1].rows;
+}
+
+static void draw_char(uint32_t x, uint32_t y,
+                      char c, uint32_t color, uint32_t scale) {
+    const uint8_t *rows = font_lookup(c);
+    for (uint32_t row = 0; row < 8; ++row) {
+        uint8_t bits = rows[row];
+        for (uint32_t col = 0; col < 8; ++col) {
+            if (bits & (0x80u >> col)) {
+                for (uint32_t dy = 0; dy < scale; ++dy) {
+                    for (uint32_t dx = 0; dx < scale; ++dx) {
+                        put_pixel(x + col * scale + dx,
+                                  y + row * scale + dy,
+                                  color);
+                    }
                 }
             }
         }
     }
 }
 
-static void draw_text(uint32_t x, uint32_t y, const char *s, uint32_t fg, uint32_t scale) {
-    uint32_t cursor_x = x;
+static void draw_text(uint32_t x, uint32_t y,
+                      const char *s, uint32_t color, uint32_t scale) {
     while (*s) {
         if (*s == '\n') {
             y += 8 * scale + 2;
-            cursor_x = x;
-            ++s;
+            x = 0;
+            s++;
             continue;
         }
-        draw_char(cursor_x, y, *s, fg, 0xFFFFFFFF, scale);
-        cursor_x += 8 * scale;
-        ++s;
+        draw_char(x, y, *s, color, scale);
+        x += 8 * scale;
+        s++;
     }
 }
 
 // ---------------------------------------------------------------------
-// Simple string helpers
+// Boot splash: bulb + "LightOS 4" + spinner UNDER the text
 // ---------------------------------------------------------------------
 
-static uint32_t str_len(const char *s) {
-    uint32_t n = 0;
-    while (s && s[n]) n++;
-    return n;
+static void draw_bulb(uint32_t cx, uint32_t cy, uint32_t r,
+                      uint32_t body, uint32_t outline, uint32_t base) {
+    if (r < 32) r = 32;
+
+    // Circle
+    fill_circle(cx, cy, r, outline);
+    fill_circle(cx, cy, r - 3, body);
+
+    // Short base so text has room below
+    uint32_t base_w = (r * 4) / 3;
+    if (base_w < 32) base_w = 32;
+    uint32_t base_h = r / 3;
+    if (base_h < 12) base_h = 12;
+
+    uint32_t base_x = cx - base_w / 2;
+    uint32_t base_y = cy + r + 8;
+    fill_rect(base_x, base_y, base_w, base_h, base);
 }
 
-static int str_eq(const char *a, const char *b) {
-    if (!a || !b) return 0;
-    while (*a && *b && *a == *b) {
-        ++a; ++b;
+static void draw_spinner_frame(uint32_t cx, uint32_t cy,
+                               uint32_t radius, uint32_t frame,
+                               uint32_t bg) {
+    const int8_t dx[8] = { 0,  1,  1,  1,  0, -1, -1, -1 };
+    const int8_t dy[8] = { -1, -1,  0,  1,  1,  1,  0, -1 };
+
+    uint32_t dot = radius / 3;
+    if (dot < 3) dot = 3;
+
+    // Clear area around spinner
+    uint32_t box = radius * 2 + dot * 2;
+    fill_rect(cx - box / 2, cy - box / 2, box, box, bg);
+
+    for (uint32_t i = 0; i < 8; ++i) {
+        int32_t px = (int32_t)cx + dx[i] * (int32_t)radius;
+        int32_t py = (int32_t)cy + dy[i] * (int32_t)radius;
+        uint32_t col = (i == (frame & 7)) ? 0xFFFFFFu : 0x505060u;
+        fill_rect((uint32_t)(px - (int32_t)(dot / 2)),
+                  (uint32_t)(py - (int32_t)(dot / 2)),
+                  dot, dot, col);
     }
-    return (*a == 0 && *b == 0);
 }
 
-static int str_starts_with(const char *s, const char *prefix) {
-    if (!s || !prefix) return 0;
-    while (*prefix) {
-        if (*s != *prefix) return 0;
-        ++s;
-        ++prefix;
-    }
-    return 1;
-}
+static void run_boot_splash(void) {
+    const uint32_t bg           = 0x101020u;
+    const uint32_t bulb_body    = 0xFFF7CCu;
+    const uint32_t bulb_outline = 0xD0C080u;
+    const uint32_t bulb_base    = 0x303040u;
 
-// ---------------------------------------------------------------------
-// Very small virtual filesystem for File Block + Command Block
-// ---------------------------------------------------------------------
+    fill_rect(0, 0, g_width, g_height, bg);
 
-typedef enum {
-    VNODE_DIR,
-    VNODE_FILE
-} VNodeType;
+    uint32_t cx = g_width  / 2;
+    uint32_t cy = g_height / 3;
+    uint32_t r  = g_height / 12;
+    if (r < 40) r = 40;
 
-typedef struct VNode VNode;
-struct VNode {
-    const char *name;
-    VNodeType   type;
-    const char *ext;       // file extension for files (e.g. "txt", "mp3"), NULL for dirs
-    const char *content;   // text content for .txt files, NULL for binary/other
-    const VNode *parent;   // parent directory (NULL for root)
-    const VNode *children; // child array for directories
-    uint32_t     child_count;
-};
+    draw_bulb(cx, cy, r, bulb_body, bulb_outline, bulb_base);
 
-static const VNode fs_root;
-static const VNode fs_home;
-static const VNode fs_system;
+    uint32_t text_scale = 3;
+    uint32_t text_h     = 8 * text_scale;
 
-static const VNode fs_root_children[];
-static const VNode fs_home_children[];
-static const VNode fs_system_children[];
+    uint32_t base_h      = r / 3;
+    if (base_h < 12) base_h = 12;
+    uint32_t base_bottom = cy + r + 8 + base_h;
 
-// Directories
-static const VNode fs_root = {
-    "", VNODE_DIR, 0, 0, 0,
-    fs_root_children, 3
-};
+    uint32_t title_y = base_bottom + 16;       // BELOW bulb
+    const char *title = "LIGHTOS 4";
+    uint32_t text_w  = 9 * 8 * text_scale;     // approximate width
+    uint32_t title_x = (cx > text_w / 2) ? cx - text_w / 2 : 0;
 
-static const VNode fs_home = {
-    "home", VNODE_DIR, 0, 0, &fs_root,
-    fs_home_children, 3
-};
+    uint32_t spinner_r = r / 2;
+    uint32_t spinner_y = title_y + text_h + 24; // clearly under text
 
-static const VNode fs_system = {
-    "system", VNODE_DIR, 0, 0, &fs_root,
-    fs_system_children, 2
-};
+    for (uint32_t frame = 0; frame < 48; ++frame) {
+        fill_rect(0, 0, g_width, g_height, bg);
+        draw_bulb(cx, cy, r, bulb_body, bulb_outline, bulb_base);
+        draw_text(title_x, title_y, title, 0xFFFFFFu, text_scale);
+        draw_spinner_frame(cx, spinner_y, spinner_r, frame, bg);
 
-// Root children
-static const VNode fs_root_children[] = {
-    { "home",   VNODE_DIR, 0, 0, &fs_root, fs_home_children,   3 },
-    { "system", VNODE_DIR, 0, 0, &fs_root, fs_system_children, 2 },
-    { "readme.txt", VNODE_FILE, "txt",
-      "Welcome to LightOS 4!\\n"
-      "This is a demo virtual filesystem.\\n"
-      "Use 'dir' or 'ls' to list entries.\\n",
-      &fs_root, 0, 0
-    }
-};
-
-// /home children
-static const VNode fs_home_children[] = {
-    { "notes.txt", VNODE_FILE, "txt",
-      "This is notes.txt in C:/home.\\n"
-      "Sample commands: help, dir/ls, cd, cat/type, echo, start.\\n",
-      &fs_home, 0, 0
-    },
-    { "song.mp3", VNODE_FILE, "mp3",
-      0,
-      &fs_home, 0, 0
-    },
-    { "video.mp4", VNODE_FILE, "mp4",
-      0,
-      &fs_home, 0, 0
-    }
-};
-
-// /system children
-static const VNode fs_system_children[] = {
-    { "cmd.exe",       VNODE_FILE, "exe", 0, &fs_system, 0, 0 },
-    { "lightweb.exe",  VNODE_FILE, "exe", 0, &fs_system, 0, 0 }
-};
-
-static const VNode *g_fs_root    = &fs_root;
-static const VNode *g_cwd        = &fs_root;  // current working directory for Command Block
-static const VNode *g_file_dir   = &fs_root;  // directory currently shown in File Block
-static uint32_t     g_file_index = 0;         // selected entry in File Block
-
-// Case-insensitive compare for ASCII letters, up to n characters
-static int str_ncasecmp_simple(const char *a, const char *b, uint32_t n) {
-    for (uint32_t i = 0; i < n; ++i) {
-        char ca = a[i];
-        char cb = b[i];
-        if (!ca || !cb) return ca == cb;
-        if (ca >= 'A' && ca <= 'Z') ca = (char)(ca - 'A' + 'a');
-        if (cb >= 'A' && cb <= 'Z') cb = (char)(cb - 'A' + 'a');
-        if (ca != cb) return 0;
-    }
-    return 1;
-}
-
-// Match a child name against a query, allowing omission of the extension.
-// For example, "notes" matches "notes.txt".
-static int fs_name_matches(const VNode *node, const char *query) {
-    if (!node || !query) return 0;
-
-    // Exact match
-    if (str_eq(node->name, query)) return 1;
-
-    // Compare without extension, case-insensitive
-    uint32_t base_len = 0;
-    while (node->name[base_len] && node->name[base_len] != '.') {
-        base_len++;
-    }
-    uint32_t qlen = str_len(query);
-    if (qlen != base_len) return 0;
-    return str_ncasecmp_simple(node->name, query, base_len);
-}
-
-static const VNode *fs_find_child(const VNode *dir, const char *name) {
-    if (!dir || dir->type != VNODE_DIR || !name) return 0;
-    for (uint32_t i = 0; i < dir->child_count; ++i) {
-        const VNode *child = &dir->children[i];
-        if (fs_name_matches(child, name)) return child;
-    }
-    return 0;
-}
-
-// Build a simple C: style path like "C:/home/"
-static void fs_build_path(const VNode *node, char *buf, uint32_t buf_size) {
-    if (!buf || buf_size == 0) return;
-    buf[0] = '\0';
-    if (!node) return;
-
-    // Collect ancestors
-    const VNode *stack[8];
-    uint32_t depth = 0;
-    const VNode *cur = node;
-    while (cur && depth < 8) {
-        stack[depth++] = cur;
-        cur = cur->parent;
-    }
-
-    uint32_t pos = 0;
-    const char *prefix = "C:/";
-    for (uint32_t i = 0; prefix[i] && pos < buf_size - 1; ++i) {
-        buf[pos++] = prefix[i];
-    }
-
-    // Walk from root child downwards, skipping root itself (which has empty name)
-    for (int i = (int)depth - 2; i >= 0 && pos < (int)buf_size - 1; --i) {
-        const char *name = stack[i]->name;
-        if (name && name[0]) {
-            for (uint32_t j = 0; name[j] && pos < buf_size - 1; ++j) {
-                buf[pos++] = name[j];
-            }
-            if (stack[i]->type == VNODE_DIR && pos < buf_size - 1) {
-                buf[pos++] = '/';
-            }
+        // crude delay loop for animation
+        for (volatile uint64_t wait = 0; wait < 12000000ULL; ++wait) {
+            __asm__ volatile("");
         }
     }
-
-    buf[pos] = '\0';
 }
 
 // ---------------------------------------------------------------------
 // Command Block terminal state
 // ---------------------------------------------------------------------
 
-#define TERM_MAX_LINES 40
-#define TERM_MAX_COLS  80
+#define TERM_MAX_LINES 32
+#define TERM_MAX_COLS  72
 
 typedef struct {
     char     lines[TERM_MAX_LINES][TERM_MAX_COLS];
@@ -303,55 +474,69 @@ typedef struct {
 
 static TerminalState g_term;
 
-// Simple circular scroll
-static void term_add_line(TerminalState *t, const char *text) {
-    if (!t || !text) return;
+static uint32_t str_len(const char *s) {
+    uint32_t n = 0;
+    if (!s) return 0;
+    while (s[n]) ++n;
+    return n;
+}
 
-    if (t->line_count < TERM_MAX_LINES) {
-        uint32_t idx = t->line_count++;
-        uint32_t i   = 0;
-        while (text[i] && i < TERM_MAX_COLS - 1) {
-            t->lines[idx][i] = text[i];
-            ++i;
-        }
-        t->lines[idx][i] = '\0';
-    } else {
+static int str_eq(const char *a, const char *b) {
+    uint32_t i = 0;
+    while (a[i] && b[i]) {
+        if (a[i] != b[i]) return 0;
+        ++i;
+    }
+    return a[i] == 0 && b[i] == 0;
+}
+
+static int str_starts_with(const char *s, const char *prefix) {
+    uint32_t i = 0;
+    while (prefix[i]) {
+        if (s[i] != prefix[i]) return 0;
+        ++i;
+    }
+    return 1;
+}
+
+static void term_add_line(TerminalState *t, const char *s) {
+    if (!t) return;
+
+    if (t->line_count == TERM_MAX_LINES) {
         // scroll up
         for (uint32_t i = 1; i < TERM_MAX_LINES; ++i) {
-            for (uint32_t j = 0; j < TERM_MAX_COLS; ++j) {
+            for (uint32_t j = 0; j < TERM_MAX_COLS; ++j)
                 t->lines[i - 1][j] = t->lines[i][j];
-            }
         }
-        // last line
-        uint32_t i = 0;
-        while (text[i] && i < TERM_MAX_COLS - 1) {
-            t->lines[TERM_MAX_LINES - 1][i] = text[i];
-            ++i;
-        }
-        t->lines[TERM_MAX_LINES - 1][i] = '\0';
+        t->line_count = TERM_MAX_LINES - 1;
     }
+
+    uint32_t len = str_len(s);
+    if (len >= TERM_MAX_COLS) len = TERM_MAX_COLS - 1;
+
+    uint32_t idx = t->line_count++;
+    uint32_t j   = 0;
+    for (; j < len; ++j) t->lines[idx][j] = s[j];
+    t->lines[idx][j] = '\0';
 }
 
 static void term_clear(TerminalState *t) {
+    if (!t) return;
     t->line_count = 0;
-    for (uint32_t i = 0; i < TERM_MAX_LINES; ++i) {
-        t->lines[i][0] = '\0';
-    }
-    t->input_len = 0;
-    t->input[0]  = '\0';
+    t->input_len  = 0;
+    t->input[0]   = '\0';
 }
 
 static void term_init(TerminalState *t) {
     term_clear(t);
-    term_add_line(t, "LightOS 4 Command Block");
-    term_add_line(t, "Type 'help' for commands.");
-    char path[128];
-    fs_build_path(g_cwd, path, sizeof(path));
-    term_add_line(t, path);
+    term_add_line(t, "LIGHTOS 4 COMMAND BLOCK");
+    term_add_line(t, "TYPE 'HELP' FOR COMMANDS.");
 }
 
+// Convert PS/2 scancode (set 1) to ASCII (no shift)
 static char scancode_to_char(uint8_t sc) {
     switch (sc) {
+        // number row
         case 0x02: return '1';
         case 0x03: return '2';
         case 0x04: return '3';
@@ -364,6 +549,7 @@ static char scancode_to_char(uint8_t sc) {
         case 0x0B: return '0';
         case 0x0C: return '-';
         case 0x0D: return '=';
+        // QWERTY rows
         case 0x10: return 'q';
         case 0x11: return 'w';
         case 0x12: return 'e';
@@ -374,8 +560,6 @@ static char scancode_to_char(uint8_t sc) {
         case 0x17: return 'i';
         case 0x18: return 'o';
         case 0x19: return 'p';
-        case 0x1A: return '[';
-        case 0x1B: return ']';
         case 0x1E: return 'a';
         case 0x1F: return 's';
         case 0x20: return 'd';
@@ -385,9 +569,6 @@ static char scancode_to_char(uint8_t sc) {
         case 0x24: return 'j';
         case 0x25: return 'k';
         case 0x26: return 'l';
-        case 0x27: return ';';
-        case 0x28: return '\'';
-        case 0x29: return '`';
         case 0x2C: return 'z';
         case 0x2D: return 'x';
         case 0x2E: return 'c';
@@ -403,7 +584,7 @@ static char scancode_to_char(uint8_t sc) {
     }
 }
 
-static void term_execute_command(TerminalState *t, const char *cmd_raw, int *open_app) {
+static void term_execute_command(TerminalState *t, const char *cmd_raw) {
     // Trim leading spaces
     const char *cmd = cmd_raw;
     while (*cmd == ' ') ++cmd;
@@ -422,261 +603,68 @@ static void term_execute_command(TerminalState *t, const char *cmd_raw, int *ope
     echo_buf[pos] = '\0';
     term_add_line(t, echo_buf);
 
-    // Helper to skip the first word and spaces
-    const char *arg = cmd;
-    while (*arg && *arg != ' ') ++arg;
-    while (*arg == ' ') ++arg;
-
-    // HELP
-    if (str_eq(cmd, "help")) {
-        term_add_line(t, "Supported commands (Windows + Linux style):");
-        term_add_line(t, "  help");
-        term_add_line(t, "  cls, clear");
-        term_add_line(t, "  dir, ls");
-        term_add_line(t, "  cd <dir>, cd .., cd /");
-        term_add_line(t, "  pwd");
-        term_add_line(t, "  type <file>, cat <file>");
-        term_add_line(t, "  time, date");
-        term_add_line(t, "  ver, uname");
-        term_add_line(t, "  echo <text>");
-        term_add_line(t, "  start <app|file>, open <file>");
-        term_add_line(t, "Built-in dirs: home, system");
+    // HELP (Windows-style and Linux-style)
+    if (str_eq(cmd, "help") || str_eq(cmd, "/?")) {
+        term_add_line(t, "SUPPORTED COMMANDS:");
+        term_add_line(t, "  HELP");
+        term_add_line(t, "  CLS / CLEAR");
+        term_add_line(t, "  DIR / LS");
+        term_add_line(t, "  VER / UNAME");
+        term_add_line(t, "  TIME, DATE");
+        term_add_line(t, "  ECHO <TEXT>");
         return;
     }
 
-    // CLS / CLEAR
+    // CLEAR
     if (str_eq(cmd, "cls") || str_eq(cmd, "clear")) {
-        term_clear(t);
-        term_add_line(t, "LightOS 4 Command Block");
-        term_add_line(t, "Type 'help' for commands.");
-        char path[128];
-        fs_build_path(g_cwd, path, sizeof(path));
-        term_add_line(t, path);
+        term_init(t);
         return;
     }
 
-    // DIR / LS
+    // DIR / LS (fake directory listing)
     if (str_eq(cmd, "dir") || str_eq(cmd, "ls")) {
-        char path[128];
-        fs_build_path(g_cwd, path, sizeof(path));
-        term_add_line(t, path);
-        if (!g_cwd->child_count) {
-            term_add_line(t, "  [empty]");
-            return;
-        }
-        for (uint32_t i = 0; i < g_cwd->child_count; ++i) {
-            const VNode *ch = &g_cwd->children[i];
-            char line[TERM_MAX_COLS];
-            if (ch->type == VNODE_DIR) {
-                // [DIR] name/
-                uint32_t p = 0;
-                const char *prefix = "[DIR] ";
-                for (uint32_t j = 0; prefix[j] && p < TERM_MAX_COLS - 1; ++j) {
-                    line[p++] = prefix[j];
-                }
-                for (uint32_t j = 0; ch->name[j] && p < TERM_MAX_COLS - 1; ++j) {
-                    line[p++] = ch->name[j];
-                }
-                if (p < TERM_MAX_COLS - 1) line[p++] = '/';
-                line[p] = '\0';
-                term_add_line(t, line);
-            } else {
-                // file
-                uint32_t p = 0;
-                for (uint32_t j = 0; ch->name[j] && p < TERM_MAX_COLS - 1; ++j) {
-                    line[p++] = ch->name[j];
-                }
-                line[p] = '\0';
-                term_add_line(t, line);
-            }
-        }
-        return;
-    }
-
-    // CD
-    if (str_starts_with(cmd, "cd")) {
-        if (*arg == '\0') {
-            // print current directory
-            char path[128];
-            fs_build_path(g_cwd, path, sizeof(path));
-            term_add_line(t, path);
-            return;
-        }
-
-        if (str_eq(arg, "/") || str_eq(arg, "C:/")) {
-            g_cwd        = g_fs_root;
-            g_file_dir   = g_fs_root;
-            g_file_index = 0;
-        } else if (str_eq(arg, "..")) {
-            if (g_cwd->parent) {
-                g_cwd        = g_cwd->parent;
-                g_file_dir   = g_cwd;
-                g_file_index = 0;
-            }
-        } else {
-            const VNode *child = fs_find_child(g_cwd, arg);
-            if (!child) {
-                term_add_line(t, "The system cannot find the path specified.");
-                return;
-            }
-            if (child->type != VNODE_DIR) {
-                term_add_line(t, "Not a directory.");
-                return;
-            }
-            g_cwd        = child;
-            g_file_dir   = child;
-            g_file_index = 0;
-        }
-
-        char path[128];
-        fs_build_path(g_cwd, path, sizeof(path));
-        term_add_line(t, path);
-        return;
-    }
-
-    // PWD (Linux-style current directory)
-    if (str_eq(cmd, "pwd")) {
-        char path[128];
-        fs_build_path(g_cwd, path, sizeof(path));
-        term_add_line(t, path);
-        return;
-    }
-
-    // TYPE / CAT (show text file)
-    if (str_starts_with(cmd, "type") || str_starts_with(cmd, "cat")) {
-        if (*arg == '\0') {
-            term_add_line(t, "Usage: type <file>  or  cat <file>");
-            return;
-        }
-        const VNode *file = fs_find_child(g_cwd, arg);
-        if (!file || file->type != VNODE_FILE) {
-            term_add_line(t, "File not found.");
-            return;
-        }
-        if (!file->content) {
-            term_add_line(t, "[binary file]");
-            return;
-        }
-
-        // Print content line by line (split on \n)
-        const char *p = file->content;
-        char line[TERM_MAX_COLS];
-        uint32_t lp = 0;
-        while (*p) {
-            if (*p == '\n' || lp == TERM_MAX_COLS - 1) {
-                line[lp] = '\0';
-                term_add_line(t, line);
-                lp = 0;
-                if (*p == '\n') { ++p; continue; }
-            } else {
-                line[lp++] = *p++;
-            }
-        }
-        if (lp > 0) {
-            line[lp] = '\0';
-            term_add_line(t, line);
-        }
+        term_add_line(t, "Volume in drive C is LIGHTOS");
+        term_add_line(t, "Directory of C:/");
+        term_add_line(t, "  KERNEL   SYS");
+        term_add_line(t, "  BOOT     UEFI");
+        term_add_line(t, "  APPS     CMD");
+        term_add_line(t, "<NO REAL FILESYSTEM YET>");
         return;
     }
 
     // VER / UNAME
-    if (str_eq(cmd, "ver") || str_eq(cmd, "uname")) {
-        term_add_line(t, "LightOS 4.0 demo kernel");
+    if (str_eq(cmd, "ver") || str_eq(cmd, "uname") || str_eq(cmd, "uname -a")) {
+        term_add_line(t, "LightOS 4 (kernel 0.1)");
+        term_add_line(t, "x86_64, single core, no MMU");
         return;
     }
 
-    // TIME / DATE (still stubbed)
-    if (str_eq(cmd, "time") || str_eq(cmd, "date")) {
-        term_add_line(t, "[Time/date not implemented yet]");
+    // TIME / DATE (fake)
+    if (str_eq(cmd, "time")) {
+        term_add_line(t, "Current time: 12:34 (demo)");
+        return;
+    }
+    if (str_eq(cmd, "date")) {
+        term_add_line(t, "Current date: 2026-01-19 (demo)");
         return;
     }
 
     // ECHO
     if (str_starts_with(cmd, "echo")) {
-        const char *p = arg;
+        const char *p = cmd + 4;
+        if (*p == ' ') ++p;
         if (*p == '\0') term_add_line(t, "");
         else            term_add_line(t, p);
         return;
     }
 
-    // START / OPEN (basic launcher)
-    if (str_starts_with(cmd, "start") || str_starts_with(cmd, "open")) {
-        if (*arg == '\0') {
-            term_add_line(t, "Usage: start <app|file>  or  open <file>");
-            return;
-        }
-
-        // App aliases
-        if (str_eq(arg, "cmd") || str_eq(arg, "command") || str_eq(arg, "terminal")) {
-            if (open_app) *open_app = 2;   // Command Block
-            return;
-        }
-        if (str_eq(arg, "files") || str_eq(arg, "fileblock") || str_eq(arg, "explorer")) {
-            if (open_app) *open_app = 1;   // File Block
-            g_file_dir   = g_cwd;
-            g_file_index = 0;
-            return;
-        }
-        if (str_eq(arg, "browser") || str_eq(arg, "lightweb")) {
-            if (open_app) *open_app = 3;   // Browser
-            return;
-        }
-
-        // Try to open as file in current directory
-        const VNode *file = fs_find_child(g_cwd, arg);
-        if (!file) {
-            term_add_line(t, "File not found.");
-            return;
-        }
-
-        if (file->type == VNODE_DIR) {
-            g_cwd        = file;
-            g_file_dir   = file;
-            g_file_index = 0;
-            char path[128];
-            fs_build_path(g_cwd, path, sizeof(path));
-            term_add_line(t, path);
-            return;
-        }
-
-        if (file->ext && str_eq(file->ext, "txt") && file->content) {
-            term_add_line(t, "[Opening text file in Command Block]");
-            const char *p = file->content;
-            char line[TERM_MAX_COLS];
-            uint32_t lp = 0;
-            while (*p) {
-                if (*p == '\n' || lp == TERM_MAX_COLS - 1) {
-                    line[lp] = '\0';
-                    term_add_line(t, line);
-                    lp = 0;
-                    if (*p == '\n') { ++p; continue; }
-                } else {
-                    line[lp++] = *p++;
-                }
-            }
-            if (lp > 0) {
-                line[lp] = '\0';
-                term_add_line(t, line);
-            }
-            return;
-        }
-
-        if (file->ext && (str_eq(file->ext, "mp3") || str_eq(file->ext, "wav"))) {
-            term_add_line(t, "[Pretending to play audio file]");
-            return;
-        }
-
-        if (file->ext && (str_eq(file->ext, "mp4") || str_eq(file->ext, "avi"))) {
-            term_add_line(t, "[Pretending to play video file]");
-            return;
-        }
-
-        if (file->ext && str_eq(file->ext, "exe")) {
-            term_add_line(t, "[Cannot execute real EXE yet; stub only]");
-            return;
-        }
-
-        term_add_line(t, "[Unknown file type]");
+    // Stub hooks for future Windows/Linux-style commands
+    if (str_starts_with(cmd, "cd ") || str_eq(cmd, "cd")) {
+        term_add_line(t, "Directory changing not implemented yet.");
+        return;
+    }
+    if (str_starts_with(cmd, "start ") || str_starts_with(cmd, "./")) {
+        term_add_line(t, "Program execution not implemented yet.");
         return;
     }
 
@@ -687,9 +675,8 @@ static void term_handle_scancode(uint8_t sc, TerminalState *t,
                                  int *selected_icon, int *open_app) {
     (void)selected_icon; // not used while inside Command Block
 
-    // Ignore releases; we only care about presses
     if (sc == 0xE0) return;      // ignore extended prefix for now
-    if (sc & 0x80) return;
+    if (sc & 0x80) return;       // ignore key releases
 
     if (sc == 0x01) {            // Esc: close Command Block
         *open_app = -1;
@@ -706,7 +693,7 @@ static void term_handle_scancode(uint8_t sc, TerminalState *t,
 
     if (sc == 0x1C) {            // Enter
         t->input[t->input_len] = '\0';
-        term_execute_command(t, t->input, open_app);
+        term_execute_command(t, t->input);
         t->input_len = 0;
         t->input[0] = '\0';
         return;
@@ -723,111 +710,169 @@ static void term_handle_scancode(uint8_t sc, TerminalState *t,
 // Desktop widgets & main window
 // ---------------------------------------------------------------------
 
-static void draw_wifi_icon(uint32_t x, uint32_t y) {
-    draw_text(x, y, ")))", 0xFFFFFF, 1);
-    draw_text(x, y + 8, " | ", 0xFFFFFF, 1);
+static void draw_wifi_icon(uint32_t x, uint32_t y, uint32_t size) {
+    uint32_t bar_h = size / 5;
+    if (bar_h < 2) bar_h = 2;
+
+    // Fake full signal bars
+    fill_rect(x,              y + size - bar_h,      size / 4, bar_h, 0xFFFFFFu);
+    fill_rect(x + size / 3,   y + size - 2 * bar_h,  size / 4, bar_h, 0xFFFFFFu);
+    fill_rect(x + 2*size / 3, y + size - 3 * bar_h,  size / 4, bar_h, 0xFFFFFFu);
 }
 
-static void draw_battery_icon(uint32_t x, uint32_t y) {
-    fill_rect(x,     y,     22, 10, 0x00FF00);
-    fill_rect(x + 22, y + 2, 2,  6, 0xFFFFFF);
+static void draw_battery_icon(uint32_t x, uint32_t y,
+                              uint32_t w, uint32_t h,
+                              uint32_t percent) {
+    if (w < 18) w = 18;
+    if (h < 8)  h = 8;
+    uint32_t border = 2;
+
+    // Frame
+    fill_rect(x, y, w, h, 0xFFFFFFu);
+    fill_rect(x + border, y + border,
+              w - 2 * border, h - 2 * border, 0x202020u);
+
+    if (percent > 100) percent = 100;
+    uint32_t inner_w = w - 2 * border;
+    uint32_t fill_w  = (inner_w * percent) / 100;
+    uint32_t color   = (percent < 25) ? 0xC00000u : 0x00C000u;
+
+    fill_rect(x + border, y + border,
+              fill_w, h - 2 * border, color);
+
+    // Little nub
+    uint32_t nub_w = w / 8;
+    if (nub_w < 2) nub_w = 2;
+    fill_rect(x + w, y + h / 3, nub_w, h / 3, 0xFFFFFFu);
 }
 
-static void draw_clock(uint32_t x, uint32_t y) {
-    draw_text(x, y, "12:34", 0xFFFFFF, 1);
-    draw_text(x, y + 10, "2026-01-19", 0xFFFFFF, 1);
+static void draw_speaker_icon(uint32_t x, uint32_t y, uint32_t size) {
+    uint32_t box = size / 2;
+    if (box < 4) box = 4;
+    fill_rect(x, y + (size - box) / 2, box, box, 0xFFFFFFu);
+    fill_rect(x + box, y + (size - box) / 2 + box / 4,
+              box / 2, box / 2, 0xFFFFFFu);
 }
 
-static void draw_settings_contents(uint32_t win_x, uint32_t win_y,
+static void draw_clock_box(uint32_t x, uint32_t y,
+                           uint32_t w, uint32_t h) {
+    // Static time/date placeholder
+    fill_rect(x, y, w, h, 0x404040u);
+    draw_text(x + 4, y + 2,         "12:34",      0xFFFFFFu, 1);
+    draw_text(x + 4, y + h / 2 + 1, "2026-01-19", 0xC0C0C0u, 1);
+}
+
+// Left column: 5 app icons, with selection highlight
+static void draw_app_icons(int selected) {
+    uint32_t icon_w = g_width / 18;
+    uint32_t icon_h = g_height / 11;
+    if (icon_w < 40) icon_w = 40;
+    if (icon_h < 40) icon_h = 40;
+
+    uint32_t gap = icon_h / 5;
+    uint32_t x   = icon_w / 2;
+    uint32_t y   = icon_h / 2;
+
+    uint32_t panel_bg = 0x003366u;
+    fill_rect(0, 0, x + icon_w + gap, g_height, panel_bg);
+
+    for (int idx = 0; idx < 5; ++idx) {
+        uint32_t bg = (idx == selected) ? 0x4C7AB5u : 0x234567u;
+        fill_rect(x, y, icon_w, icon_h, bg);
+
+        uint32_t inner_x = x + icon_w / 8;
+        uint32_t inner_y = y + icon_h / 8;
+        uint32_t inner_w = icon_w * 3 / 4;
+        uint32_t inner_h = icon_h * 3 / 4;
+
+        switch (idx) {
+            case 0: // Settings (simple square)
+                fill_rect(inner_x, inner_y, inner_w, inner_h, 0xE0E0E0u);
+                break;
+            case 1: // File Block (folder)
+                fill_rect(inner_x, inner_y + inner_h / 4,
+                          inner_w, inner_h * 3 / 4, 0xFFE79Cu);
+                fill_rect(inner_x, inner_y,
+                          inner_w / 2, inner_h / 3, 0xFFE79Cu);
+                break;
+            case 2: // Command Block
+                fill_rect(inner_x, inner_y, inner_w, inner_h, 0x000000u);
+                fill_rect(inner_x + inner_w / 6,
+                          inner_y + inner_h / 2,
+                          inner_w / 5, inner_h / 10, 0x00FF00u);
+                break;
+            case 3: { // Browser (blue circle)
+                uint32_t cx = inner_x + inner_w / 2;
+                uint32_t cy = inner_y + inner_h / 2;
+                uint32_t r  = inner_h / 3;
+                for (int32_t yy = -(int32_t)r; yy <= (int32_t)r; ++yy) {
+                    for (int32_t xx = -(int32_t)r; xx <= (int32_t)r; ++xx) {
+                        if (xx * xx + yy * yy <= (int32_t)r * (int32_t)r) {
+                            put_pixel(cx + xx, cy + yy, 0x3399FFu);
+                        }
+                    }
+                }
+                break;
+            }
+            case 4: // App Store (bag)
+                fill_rect(inner_x, inner_y + inner_h / 3,
+                          inner_w, inner_h * 2 / 3, 0xFFFFFFu);
+                fill_rect(inner_x + inner_w / 4,
+                          inner_y + inner_h / 3 - inner_h / 5,
+                          inner_w / 2, inner_h / 5, 0xFFFFFFu);
+                break;
+        }
+
+        y += icon_h + gap;
+    }
+}
+
+static void draw_terminal_contents(uint32_t win_x, uint32_t win_y,
                                    uint32_t win_w, uint32_t win_h,
                                    uint32_t title_h) {
-    (void)win_w; (void)win_h;
-    uint32_t y = win_y + title_h + 16;
-    draw_text(win_x + 12, y, "LightOS Settings (demo)", 0x000000, 2);
-    y += 20;
-    draw_text(win_x + 12, y, "- Theme: Classic Blue", 0x000000, 1);
-    y += 14;
-    draw_text(win_x + 12, y, "- User accounts: not implemented yet", 0x000000, 1);
-}
+    (void)win_w; // not currently used
 
-static void draw_browser_contents(uint32_t win_x, uint32_t win_y,
-                                  uint32_t win_w, uint32_t win_h,
-                                  uint32_t title_h) {
-    (void)win_w; (void)win_h;
-    uint32_t y = win_y + title_h + 16;
-    draw_text(win_x + 12, y, "LightWeb (offline demo browser)", 0x000000, 2);
-    y += 20;
-    draw_text(win_x + 12, y, "There is no real network stack yet,", 0x000000, 1);
-    y += 14;
-    draw_text(win_x + 12, y, "so this browser shows only built-in text.", 0x000000, 1);
-}
+    uint32_t x = win_x + 10;
+    uint32_t y = win_y + title_h + 10;
 
-static void draw_file_block(uint32_t win_x, uint32_t win_y,
-                            uint32_t win_w, uint32_t win_h,
-                            uint32_t title_h) {
-    uint32_t y = win_y + title_h + 8;
-
-    char path[128];
-    fs_build_path(g_file_dir, path, sizeof(path));
-    draw_text(win_x + 12, y, path, 0x000000, 1);
-    y += 18;
-
-    if (!g_file_dir->child_count) {
-        draw_text(win_x + 12, y, "[empty]", 0x000000, 1);
-        return;
+    for (uint32_t i = 0; i < g_term.line_count; ++i) {
+        draw_text(x, y, g_term.lines[i], 0xFFFFFFu, 1);
+        y += 12;
+        if (y + 12 >= win_y + win_h) break;
     }
 
-    uint32_t line_h = 14;
-    for (uint32_t i = 0; i < g_file_dir->child_count; ++i) {
-        const VNode *ch = &g_file_dir->children[i];
-        uint32_t row_y = y + i * (line_h + 2);
-
-        uint32_t bg = (i == g_file_index) ? 0x303030 : 0x000000;
-        uint32_t text_col = 0xFFFFFF;
-
-        // highlight rectangle
-        fill_rect(win_x + 8, row_y - 2, win_w - 16, line_h + 4, bg);
-
-        char line[TERM_MAX_COLS];
-        uint32_t p = 0;
-        if (ch->type == VNODE_DIR) {
-            const char *prefix = "[DIR] ";
-            for (uint32_t j = 0; prefix[j] && p < TERM_MAX_COLS - 1; ++j) {
-                line[p++] = prefix[j];
-            }
+    // Prompt
+    if (y + 16 < win_y + win_h) {
+        char buf[TERM_MAX_COLS];
+        buf[0] = '>';
+        buf[1] = ' ';
+        uint32_t len = g_term.input_len;
+        if (len > TERM_MAX_COLS - 3) len = TERM_MAX_COLS - 3;
+        for (uint32_t i = 0; i < len; ++i) {
+            buf[2 + i] = g_term.input[i];
         }
-        for (uint32_t j = 0; ch->name[j] && p < TERM_MAX_COLS - 1; ++j) {
-            line[p++] = ch->name[j];
-        }
-        line[p] = '\0';
-
-        draw_text(win_x + 12, row_y, line, text_col, 1);
+        buf[2 + len] = '\0';
+        draw_text(x, y + 4, buf, 0x00FF00u, 1);
     }
-
-    draw_text(win_x + 8, win_y + win_h - 20,
-              "Enter: open   Backspace: up   ESC: close",
-              0x000000, 1);
 }
 
 static void draw_main_window(int open_app) {
-    if (open_app < 0) return;
-
     uint32_t win_w = (g_width * 3) / 5;
     uint32_t win_h = (g_height * 3) / 5;
     uint32_t win_x = (g_width - win_w) / 2;
     uint32_t win_y = (g_height - win_h) / 2;
     if (win_y < 10) win_y = 10;
 
-    uint32_t border_col = 0x000000;
-    uint32_t title_col  = 0x004080;
-    uint32_t body_col   = 0xC0C0C0;
+    uint32_t border_col = 0x000000u;
+    uint32_t title_col  = 0x004080u;
+    uint32_t body_col   = 0xC0C0C0u;
 
     switch (open_app) {
-        case 0: body_col = 0xCCE8FF; title_col = 0x0055AA; break; // Settings
-        case 1: body_col = 0xFFF0C0; title_col = 0xAA7700; break; // File Block
-        case 2: body_col = 0x101010; title_col = 0x202020; break; // Command Block
-        case 3: body_col = 0xE0F4FF; title_col = 0x0066BB; break; // Browser
-        case 4: body_col = 0xF4E0FF; title_col = 0x664488; break; // App Store (unused)
+        case 0: body_col = 0xCCE8FFu; title_col = 0x0055AAu; break; // Settings
+        case 1: body_col = 0xFFF0C0u; title_col = 0xAA7700u; break; // File Block
+        case 2: body_col = 0x101010u; title_col = 0x202020u; break; // Command Block
+        case 3: body_col = 0xE0F4FFu; title_col = 0x0066BBu; break; // Browser
+        case 4: body_col = 0xF4E0FFu; title_col = 0x664488u; break; // App Store
         default: break;
     }
 
@@ -841,43 +886,74 @@ static void draw_main_window(int open_app) {
     // Window body
     fill_rect(win_x, win_y + title_h, win_w, win_h - title_h, body_col);
 
-    // Close button (visual only)
+    // Close button (just visual)
     uint32_t btn   = (title_h > 8) ? (title_h - 8) : (title_h / 2);
     uint32_t btn_x = win_x + win_w - btn - 4;
     uint32_t btn_y = win_y + (title_h - btn) / 2;
-    fill_rect(btn_x, btn_y, btn, btn, 0x800000);
+    fill_rect(btn_x, btn_y, btn, btn, 0x800000u);
 
-    switch (open_app) {
-        case 0:
-            draw_settings_contents(win_x, win_y, win_w, win_h, title_h);
-            break;
-        case 1:
-            draw_file_block(win_x, win_y, win_w, win_h, title_h);
-            break;
-        case 2:
-            draw_terminal_contents(win_x, win_y, win_w, win_h, title_h);
-            break;
-        case 3:
-            draw_browser_contents(win_x, win_y, win_w, win_h, title_h);
-            break;
-        default:
-            break;
+    // Command Block contents
+    if (open_app == 2) {
+        draw_terminal_contents(win_x, win_y, win_w, win_h, title_h);
     }
 }
 
-// ... (keep your existing draw_terminal_contents, icon drawing, desktop
-// drawing, and boot splash functions here – unchanged, except they now
-// call draw_main_window(open_app) which will display the right app.)
+static void draw_desktop(int selected_icon, int open_app) {
+    uint32_t desktop_bg = 0x003366u;
+    uint32_t panel_bg   = 0x202020u;
+
+    // Background
+    fill_rect(0, 0, g_width, g_height, desktop_bg);
+
+    // Taskbar
+    uint32_t panel_h = g_height / 12;
+    if (panel_h < 40) panel_h = 40;
+    uint32_t panel_y = g_height - panel_h;
+    fill_rect(0, panel_y, g_width, panel_h, panel_bg);
+
+    // Start block
+    uint32_t start_w = panel_h;
+    fill_rect(0, panel_y, start_w, panel_h, 0x404040u);
+
+    // Tray
+    uint32_t tray_w = g_width / 4;
+    if (tray_w < 220) tray_w = 220;
+    uint32_t tray_x = g_width - tray_w;
+    fill_rect(tray_x, panel_y, tray_w, panel_h, 0x303030u);
+
+    uint32_t icon_size = panel_h / 2;
+    if (icon_size < 16) icon_size = 16;
+    uint32_t icon_y = panel_y + (panel_h - icon_size) / 2;
+
+    uint32_t cursor_x = tray_x + tray_w - icon_size - 8;
+    draw_wifi_icon(cursor_x, icon_y, icon_size);
+    cursor_x -= icon_size + 8;
+
+    draw_speaker_icon(cursor_x, icon_y, icon_size);
+    cursor_x -= icon_size + 12;
+
+    draw_battery_icon(cursor_x, icon_y, icon_size * 3 / 2, icon_size, 76);
+    cursor_x -= icon_size * 2;
+
+    // Clock on left of tray
+    uint32_t clock_w = tray_w / 3;
+    uint32_t clock_h = icon_size + 10;
+    uint32_t clock_x = tray_x + 8;
+    uint32_t clock_y = panel_y + (panel_h - clock_h) / 2;
+    draw_clock_box(clock_x, clock_y, clock_w, clock_h);
+
+    // App icons + active window
+    draw_app_icons(selected_icon);
+    draw_main_window(open_app);
+}
 
 // ---------------------------------------------------------------------
-// File Block keyboard handler
+// Keyboard navigation (desktop-level)
 // ---------------------------------------------------------------------
 
-static void file_block_handle_scancode(uint8_t sc,
-                                       int *selected_icon,
-                                       int *open_app) {
-    (void)selected_icon;
-
+static void handle_nav_scancode(uint8_t sc,
+                                int *selected_icon,
+                                int *open_app) {
     static uint8_t ext = 0;
 
     if (sc == 0xE0) {
@@ -886,20 +962,16 @@ static void file_block_handle_scancode(uint8_t sc,
     }
 
     if (ext) {
-        uint8_t code = sc & 0x7F;
-        if (!(sc & 0x80)) {
+        uint8_t code = sc & 0x7Fu;
+        if (!(sc & 0x80u)) {
             switch (code) {
-                case 0x48: // Up arrow
-                    if (g_file_dir->child_count) {
-                        if (g_file_index == 0) g_file_index = g_file_dir->child_count - 1;
-                        else                   g_file_index--;
-                    }
+                case 0x48: // Up
+                    if (*selected_icon > 0) (*selected_icon)--;
+                    else *selected_icon = 4;
                     break;
-                case 0x50: // Down arrow
-                    if (g_file_dir->child_count) {
-                        g_file_index++;
-                        if (g_file_index >= g_file_dir->child_count) g_file_index = 0;
-                    }
+                case 0x50: // Down
+                    if (*selected_icon < 4) (*selected_icon)++;
+                    else *selected_icon = 0;
                     break;
                 default:
                     break;
@@ -909,87 +981,25 @@ static void file_block_handle_scancode(uint8_t sc,
         return;
     }
 
-    if (sc & 0x80) return; // ignore releases
+    if (sc & 0x80u) return; // key release
 
-    if (sc == 0x01) {      // Esc
-        *open_app = -1;
-        return;
-    }
-
-    if (sc == 0x0E) {      // Backspace: go up one directory
-        if (g_file_dir->parent) {
-            g_file_dir   = g_file_dir->parent;
-            g_cwd        = g_file_dir;
-            g_file_index = 0;
-        }
-        return;
-    }
-
-    if (sc == 0x1C) {      // Enter: open selected entry
-        if (!g_file_dir->child_count) return;
-        if (g_file_index >= g_file_dir->child_count) {
-            g_file_index = g_file_dir->child_count - 1;
-        }
-        const VNode *node = &g_file_dir->children[g_file_index];
-
-        if (node->type == VNODE_DIR) {
-            g_file_dir   = node;
-            g_cwd        = node;
-            g_file_index = 0;
-            return;
-        }
-
-        // For files, jump into Command Block and display something
-        *open_app = 2;
-        term_clear(&g_term);
-        term_add_line(&g_term, "LightOS 4 Command Block");
-        term_add_line(&g_term, "Opened from File Block:");
-
-        char line[TERM_MAX_COLS];
-        uint32_t lp = 0;
-
-        if (node->ext && str_eq(node->ext, "txt") && node->content) {
-            const char *p = node->content;
-            while (*p) {
-                if (*p == '\n' || lp == TERM_MAX_COLS - 1) {
-                    line[lp] = '\0';
-                    term_add_line(&g_term, line);
-                    lp = 0;
-                    if (*p == '\n') { ++p; continue; }
-                } else {
-                    line[lp++] = *p++;
-                }
-            }
-            if (lp > 0) {
-                line[lp] = '\0';
-                term_add_line(&g_term, line);
-            }
-        } else if (node->ext && (str_eq(node->ext, "mp3") || str_eq(node->ext, "wav"))) {
-            term_add_line(&g_term, "[Pretending to play audio file]");
-        } else if (node->ext && (str_eq(node->ext, "mp4") || str_eq(node->ext, "avi"))) {
-            term_add_line(&g_term, "[Pretending to play video file]");
-        } else if (node->ext && str_eq(node->ext, "exe")) {
-            term_add_line(&g_term, "[Executable stub; real apps not implemented]");
-        } else {
-            term_add_line(&g_term, "[Unknown file type]");
-        }
-
-        return;
+    switch (sc) {
+        case 0x1C: // Enter
+            *open_app = *selected_icon;
+            break;
+        case 0x01: // Esc
+            *open_app = -1;
+            break;
+        default:
+            break;
     }
 }
-
-// ---------------------------------------------------------------------
-// Desktop navigation handler (existing code) – only change is that
-// kernel_main now calls file_block_handle_scancode / term_handle_scancode
-// depending on open_app.
-// ---------------------------------------------------------------------
-
-// ... keep your handle_nav_scancode, draw_desktop, run_boot_splash etc.
 
 // ---------------------------------------------------------------------
 // Kernel entry
 // ---------------------------------------------------------------------
 
+__attribute__((noreturn))
 void kernel_main(BootInfo *bi) {
     g_fb     = (uint32_t*)(uintptr_t)bi->framebuffer_base;
     g_width  = bi->framebuffer_width;
@@ -1002,8 +1012,8 @@ void kernel_main(BootInfo *bi) {
     // 2) Desktop + Command Block
     term_init(&g_term);
 
-    int selected_icon = 2;   // highlight Command Block by default
-    int open_app      = -1;  // -1 = nothing open
+    int selected_icon = 2;   // default to Command Block icon
+    int open_app      = 2;   // open Command Block on boot
 
     draw_desktop(selected_icon, open_app);
 
@@ -1016,22 +1026,31 @@ void kernel_main(BootInfo *bi) {
             if (open_app == 2) {
                 // Command Block takes over keyboard
                 term_handle_scancode(sc, &g_term, &selected_icon, &open_app);
-            } else if (open_app == 1) {
-                // File Block navigation
-                file_block_handle_scancode(sc, &selected_icon, &open_app);
             } else {
-                // Desktop navigation (select icons, open apps)
+                // Desktop navigation
                 handle_nav_scancode(sc, &selected_icon, &open_app);
             }
 
-            // Redraw when something changed, or while typing in Command/File Block
+            // Redraw when something changed, or while typing in Command Block
             if (selected_icon != prev_sel ||
                 open_app      != prev_open ||
-                open_app == 2 ||
-                open_app == 1) {
+                open_app == 2) {
                 draw_desktop(selected_icon, open_app);
             }
         }
     }
 }
 
+// ---------------------------------------------------------------------
+// Binary entry stub
+// This is placed in the .entry section at 0x00100000 and immediately
+// calls kernel_main(). The UEFI loader jumps here.
+// ---------------------------------------------------------------------
+
+__attribute__((noreturn, section(".entry")))
+void _start(BootInfo *bi) {
+    kernel_main(bi);
+    for (;;) {
+        __asm__ volatile("hlt");
+    }
+}
