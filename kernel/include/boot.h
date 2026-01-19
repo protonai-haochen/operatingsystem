@@ -7,7 +7,7 @@ typedef struct {
     uint64_t framebuffer_base;
     uint32_t framebuffer_width;
     uint32_t framebuffer_height;
-    uint32_t framebuffer_pitch;
+    uint32_t framebuffer_pitch;   // pixels per scanline
 } BootInfo;
 
 #endif
