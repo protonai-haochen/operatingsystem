@@ -1,23 +1,20 @@
 // kernel/core/kernel.c
-// Very simple 64-bit kernel: draws LightOS 4 boot screen + desktop UI.
+// LightOS 4 kernel: draws boot logo and desktop UI.
 
 #include <stdint.h>
-
-typedef struct {
-    uint64_t framebuffer_base;
-    uint32_t framebuffer_width;
-    uint32_t framebuffer_height;
-    uint32_t framebuffer_pitch;   // pixels per scanline
-} BootInfo;
+#include "boot.h"
 
 static uint32_t *g_fb    = 0;
 static uint32_t  g_width = 0;
 static uint32_t  g_height = 0;
 static uint32_t  g_pitch  = 0;
 
-// =========================
-// Basic drawing primitives
-// =========================
+// Halt helper
+static inline void hlt(void) {
+    __asm__ volatile("hlt");
+}
+
+// Basic drawing ------------------------------------------------------
 
 static inline void put_pixel(uint32_t x, uint32_t y, uint32_t color) {
     if (x >= g_width || y >= g_height) return;
@@ -35,16 +32,14 @@ static void fill_rect(uint32_t x, uint32_t y,
     if (max_y > g_height) max_y = g_height;
 
     for (uint32_t yy = y; yy < max_y; ++yy) {
-        uint32_t *row = g_fb + yy * g_pitch;
+        uint32_t *row = g_fb + (uint64_t)yy * g_pitch;
         for (uint32_t xx = x; xx < max_x; ++xx) {
             row[xx] = color;
         }
     }
 }
 
-// =========================
-// Boot screen (bulb + bar)
-// =========================
+// Boot screen --------------------------------------------------------
 
 static void draw_boot_screen(void) {
     const uint32_t bg           = 0x101020; // dark blue
@@ -93,9 +88,7 @@ static void draw_boot_screen(void) {
     fill_rect(x, bar_y, filled, bar_h, bar_fg);
 }
 
-// =========================
-// System tray icons
-// =========================
+// Tray icons ---------------------------------------------------------
 
 static void draw_wifi_icon(uint32_t x, uint32_t y, uint32_t size) {
     uint32_t bar_h = size / 5;
@@ -120,17 +113,19 @@ static void draw_battery_icon(uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
     if (w < 12) w = 12;
     if (h < 8)  h = 8;
 
-    fill_rect(x, y, w, h, 0x303030);                       // outer
-    fill_rect(x + 2, y + 2, w - 4, h - 4, 0x70C070);       // charge
+    // outer
+    fill_rect(x, y, w, h, 0x303030);
+    // "charge" 80% filled
+    uint32_t inner_w = (w - 4) * 4 / 5;
+    fill_rect(x + 2, y + 2, inner_w, h - 4, 0x70C070);
 
+    // nub
     uint32_t nub_w = w / 6;
     if (nub_w < 3) nub_w = 3;
-    fill_rect(x + w, y + h/4, nub_w, h/2, 0x303030);       // nub
+    fill_rect(x + w, y + h/4, nub_w, h/2, 0x303030);
 }
 
-// =========================
-// Desktop app icons
-// =========================
+// Desktop app icons --------------------------------------------------
 
 static void draw_app_icons(void) {
     // 5 vertical icons: Settings, File Block, Command Block, Browser, App Store
@@ -183,9 +178,152 @@ static void draw_app_icons(void) {
     fill_rect(x + 18, y + icon_h/3 - 8, icon_w - 36, 8,        0xF0F0F0);
 }
 
-// =========================
-// Desktop composition
-// =========================
+// 7-segment digit rendering ------------------------------------------
+
+static const uint8_t digit_mask[10] = {
+    0x77, // 0
+    0x24, // 1
+    0x5D, // 2
+    0x6D, // 3
+    0x2E, // 4
+    0x6B, // 5
+    0x7B, // 6
+    0x25, // 7
+    0x7F, // 8
+    0x6F  // 9
+};
+
+static void draw_digit7(uint32_t x, uint32_t y,
+                        uint32_t scale,
+                        uint8_t digit,
+                        uint32_t fg,
+                        uint32_t bg) {
+    if (digit > 9) digit = 0;
+
+    // overall cell background
+    uint32_t cell_w = 4 * scale;
+    uint32_t cell_h = 7 * scale;
+    fill_rect(x, y, cell_w, cell_h, bg);
+
+    uint8_t mask = digit_mask[digit];
+    uint32_t t = scale;          // thickness
+
+    // segments coordinates
+    // 0: top
+    if (mask & (1 << 0)) {
+        fill_rect(x + t, y, 2 * t, t, fg);
+    }
+    // 1: upper-left
+    if (mask & (1 << 1)) {
+        fill_rect(x, y + t, t, 3 * t, fg);
+    }
+    // 2: upper-right
+    if (mask & (1 << 2)) {
+        fill_rect(x + 3 * t, y + t, t, 3 * t, fg);
+    }
+    // 3: middle
+    if (mask & (1 << 3)) {
+        fill_rect(x + t, y + 3 * t, 2 * t, t, fg);
+    }
+    // 4: lower-left
+    if (mask & (1 << 4)) {
+        fill_rect(x, y + 3 * t, t, 3 * t, fg);
+    }
+    // 5: lower-right
+    if (mask & (1 << 5)) {
+        fill_rect(x + 3 * t, y + 3 * t, t, 3 * t, fg);
+    }
+    // 6: bottom
+    if (mask & (1 << 6)) {
+        fill_rect(x + t, y + 6 * t, 2 * t, t, fg);
+    }
+}
+
+static void draw_colon(uint32_t x, uint32_t y,
+                       uint32_t scale,
+                       uint32_t fg,
+                       uint32_t bg) {
+    uint32_t cell_w = 2 * scale;
+    uint32_t cell_h = 7 * scale;
+    fill_rect(x, y, cell_w, cell_h, bg);
+    uint32_t dot_size = scale;
+    fill_rect(x, y + 2 * scale, dot_size, dot_size, fg);
+    fill_rect(x, y + 5 * scale, dot_size, dot_size, fg);
+}
+
+static void draw_dash(uint32_t x, uint32_t y,
+                      uint32_t scale,
+                      uint32_t fg,
+                      uint32_t bg) {
+    uint32_t cell_w = 4 * scale;
+    uint32_t cell_h = 7 * scale;
+    fill_rect(x, y, cell_w, cell_h, bg);
+    fill_rect(x + scale, y + 3 * scale, 2 * scale, scale, fg);
+}
+
+// draw a hard-coded time/date: "12:34" and "2026-01-19"
+static void draw_time_date(uint32_t x, uint32_t y, uint32_t scale) {
+    uint32_t fg = 0xFFFFFF;
+    uint32_t bg = 0x404040;
+
+    uint32_t cursor = x;
+    uint32_t adv_digit = 5 * scale;
+    uint32_t adv_colon = 3 * scale;
+    uint32_t adv_dash  = 5 * scale;
+    uint32_t adv_space = 3 * scale; (void)adv_space;
+
+    // ---- time "12:34" ----
+    // 1
+    draw_digit7(cursor, y, scale, 1, fg, bg);
+    cursor += adv_digit;
+    // 2
+    draw_digit7(cursor, y, scale, 2, fg, bg);
+    cursor += adv_digit;
+    // :
+    draw_colon(cursor, y, scale, fg, bg);
+    cursor += adv_colon;
+    // 3
+    draw_digit7(cursor, y, scale, 3, fg, bg);
+    cursor += adv_digit;
+    // 4
+    draw_digit7(cursor, y, scale, 4, fg, bg);
+
+    // ---- date under it: "2026-01-19" ----
+    uint32_t y2 = y + 8 * scale;
+    cursor = x;
+
+    // 2
+    draw_digit7(cursor, y2, scale, 2, fg, bg);
+    cursor += adv_digit;
+    // 0
+    draw_digit7(cursor, y2, scale, 0, fg, bg);
+    cursor += adv_digit;
+    // 2
+    draw_digit7(cursor, y2, scale, 2, fg, bg);
+    cursor += adv_digit;
+    // 6
+    draw_digit7(cursor, y2, scale, 6, fg, bg);
+    cursor += adv_digit;
+    // -
+    draw_dash(cursor, y2, scale, fg, bg);
+    cursor += adv_dash;
+    // 0
+    draw_digit7(cursor, y2, scale, 0, fg, bg);
+    cursor += adv_digit;
+    // 1
+    draw_digit7(cursor, y2, scale, 1, fg, bg);
+    cursor += adv_digit;
+    // -
+    draw_dash(cursor, y2, scale, fg, bg);
+    cursor += adv_dash;
+    // 1
+    draw_digit7(cursor, y2, scale, 1, fg, bg);
+    cursor += adv_digit;
+    // 9
+    draw_digit7(cursor, y2, scale, 9, fg, bg);
+}
+
+// Desktop composition ------------------------------------------------
 
 static void draw_desktop(void) {
     const uint32_t desktop_bg   = 0x003366;
@@ -230,10 +368,16 @@ static void draw_desktop(void) {
     draw_battery_icon(ix, icon_y + (size/4), size + 16, size / 2);
     ix += size + 26;
 
-    // (time/date area reserved: just a darker block)
-    uint32_t remaining = tray_x + tray_w - ix - 8;
+    // time/date area
+    uint32_t remaining = (tray_x + tray_w) - ix - 4;
     if (remaining > 0) {
-        fill_rect(ix, icon_y, remaining, size, 0x505050);
+        fill_rect(ix, icon_y, remaining, size, 0x404040);
+        // draw static time/date in that area
+        uint32_t scale = (size / 7);
+        if (scale < 2) scale = 2;
+        uint32_t tx = ix + 4;
+        uint32_t ty = icon_y + 2;
+        draw_time_date(tx, ty, scale);
     }
 
     // app icons on desktop
@@ -261,9 +405,7 @@ static void draw_desktop(void) {
     fill_rect(btn_x, btn_y, btn_size, btn_size, close_btn);
 }
 
-// =========================
-// Kernel entry point
-// =========================
+// Kernel entry -------------------------------------------------------
 
 __attribute__((noreturn))
 void kernel_main(BootInfo *bi) {
@@ -283,9 +425,8 @@ void kernel_main(BootInfo *bi) {
     // 2) Desktop UI
     draw_desktop();
 
-    // 3) Halt forever (no returning to firmware)
+    // 3) Halt forever
     for (;;) {
-        __asm__ volatile("hlt");
+        hlt();
     }
 }
-
