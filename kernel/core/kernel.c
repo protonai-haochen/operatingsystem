@@ -39,176 +39,21 @@ static void fill_rect(uint32_t x, uint32_t y,
     }
 }
 
-// Boot screen --------------------------------------------------------
+// 7-segment style digits for tray clock / static text ----------------
 
-static void draw_boot_screen(void) {
-    const uint32_t bg           = 0x101020; // dark blue
-    const uint32_t bulb_body    = 0xFFFFCC;
-    const uint32_t bulb_outline = 0xCCCC99;
-    const uint32_t bar_bg       = 0x202030;
-    const uint32_t bar_fg       = 0x60A0FF;
+static void draw_digit7_segments(uint32_t x, uint32_t y,
+                                 uint32_t s, uint8_t mask,
+                                 uint32_t fg, uint32_t bg)
+{
+    // clear background for this digit
+    uint32_t w = 4 * s;
+    uint32_t h = 7 * s;
+    fill_rect(x, y, w, h, bg);
 
-    fill_rect(0, 0, g_width, g_height, bg);
+    // segment thickness
+    uint32_t t = s;
 
-    uint32_t cx = g_width / 2;
-    uint32_t cy = g_height / 3;
-
-    uint32_t bulb_w = g_width / 12;
-    uint32_t bulb_h = g_height / 6;
-    if (bulb_w < 40) bulb_w = 40;
-    if (bulb_h < 60) bulb_h = 60;
-
-    uint32_t bulb_x = (cx > bulb_w/2) ? (cx - bulb_w/2) : 0;
-    uint32_t bulb_y = (cy > bulb_h/2) ? (cy - bulb_h/2) : 0;
-
-    // bulb body
-    fill_rect(bulb_x, bulb_y, bulb_w, bulb_h, bulb_body);
-
-    // outline
-    fill_rect(bulb_x, bulb_y, bulb_w, 2, bulb_outline);
-    fill_rect(bulb_x, bulb_y + bulb_h - 2, bulb_w, 2, bulb_outline);
-    fill_rect(bulb_x, bulb_y, 2, bulb_h, bulb_outline);
-    fill_rect(bulb_x + bulb_w - 2, bulb_y, 2, bulb_h, bulb_outline);
-
-    // socket
-    uint32_t sock_h = bulb_h / 5;
-    if (sock_h < 6) sock_h = 6;
-    fill_rect(bulb_x, bulb_y + bulb_h, bulb_w, sock_h, bar_bg);
-
-    // progress bar
-    uint32_t bar_y = bulb_y + bulb_h + sock_h + 20;
-    uint32_t bar_w = g_width / 3;
-    uint32_t bar_h = (g_height / 100) + 6;
-    if (bar_w < 60) bar_w = 60;
-    if (bar_h < 4)  bar_h = 4;
-
-    uint32_t x = (cx > bar_w/2) ? (cx - bar_w/2) : 0;
-    fill_rect(x, bar_y, bar_w, bar_h, bar_bg);
-    uint32_t filled = (bar_w * 70) / 100; // fake 70% loaded
-    fill_rect(x, bar_y, filled, bar_h, bar_fg);
-}
-
-// Tray icons ---------------------------------------------------------
-
-static void draw_wifi_icon(uint32_t x, uint32_t y, uint32_t size) {
-    uint32_t bar_h = size / 5;
-    if (bar_h < 2) bar_h = 2;
-
-    fill_rect(x,              y + size - bar_h,       size / 3,       bar_h, 0xC0C0C0);
-    fill_rect(x + size/3,     y + size - 2*bar_h - 1, size / 3,       bar_h, 0xA0A0A0);
-    fill_rect(x + 2*size/3,   y + size - 3*bar_h - 2, size / 3,       bar_h, 0x808080);
-}
-
-static void draw_speaker_icon(uint32_t x, uint32_t y, uint32_t size) {
-    uint32_t sq = size / 2;
-    if (sq < 4) sq = 4;
-    fill_rect(x, y + (size - sq)/2, sq, sq, 0xD0D0D0);
-
-    uint32_t bx = x + sq + 2;
-    fill_rect(bx,     y + size/2 - 3, 3,  6, 0xB0B0B0);
-    fill_rect(bx + 4, y + size/2 - 5, 3, 10, 0x909090);
-}
-
-static void draw_battery_icon(uint32_t x, uint32_t y, uint32_t w, uint32_t h) {
-    if (w < 12) w = 12;
-    if (h < 8)  h = 8;
-
-    // outer
-    fill_rect(x, y, w, h, 0x303030);
-    // "charge" 80% filled
-    uint32_t inner_w = (w - 4) * 4 / 5;
-    fill_rect(x + 2, y + 2, inner_w, h - 4, 0x70C070);
-
-    // nub
-    uint32_t nub_w = w / 6;
-    if (nub_w < 3) nub_w = 3;
-    fill_rect(x + w, y + h/4, nub_w, h/2, 0x303030);
-}
-
-// Desktop app icons --------------------------------------------------
-
-static void draw_app_icons(void) {
-    // 5 vertical icons: Settings, File Block, Command Block, Browser, App Store
-    uint32_t icon_w = g_width / 16;
-    uint32_t icon_h = g_height / 10;
-    if (icon_w < 64) icon_w = 64;
-    if (icon_h < 64) icon_h = 64;
-
-    uint32_t x   = 32;
-    uint32_t y   = 40;
-    uint32_t gap = 16;
-
-    // Settings (gear-ish)
-    fill_rect(x, y, icon_w, icon_h, 0x2E4F7F);
-    fill_rect(x + icon_w/4, y + icon_h/4, icon_w/2, icon_h/2, 0xB0B0B0);
-    y += icon_h + gap;
-
-    // File Block (folder)
-    fill_rect(x, y, icon_w, icon_h, 0x355C8B);
-    fill_rect(x + 6, y + icon_h/3,     icon_w - 12, icon_h/2,     0xE0E090);
-    fill_rect(x + 6, y + icon_h/3 - 10, icon_w/2,   10,           0xE0E090);
-    y += icon_h + gap;
-
-    // Command Block (terminal)
-    fill_rect(x, y, icon_w, icon_h, 0x284060);
-    fill_rect(x + 8, y + 8, icon_w - 16, icon_h - 16, 0x101010);
-    fill_rect(x + 14, y + icon_h/2 - 2, 10, 3, 0x40FF40);
-    fill_rect(x + 22, y + icon_h/2 - 5, 3,  9, 0x40FF40);
-    y += icon_h + gap;
-
-    // Browser (globe)
-    fill_rect(x, y, icon_w, icon_h, 0x305070);
-    uint32_t cx = x + icon_w / 2;
-    uint32_t cy = y + icon_h / 2;
-    uint32_t r  = icon_h / 3;
-    for (uint32_t yy = cy - r; yy <= cy + r; ++yy) {
-        for (uint32_t xx = cx - r; xx <= cx + r; ++xx) {
-            int32_t dx = (int32_t)xx - (int32_t)cx;
-            int32_t dy = (int32_t)yy - (int32_t)cy;
-            if (dx*dx + dy*dy <= (int32_t)r*(int32_t)r) {
-                put_pixel(xx, yy, 0x50C0FF);
-            }
-        }
-    }
-    y += icon_h + gap;
-
-    // App Store (shopping bag)
-    fill_rect(x, y, icon_w, icon_h, 0x364F6F);
-    fill_rect(x + 10, y + icon_h/3,     icon_w - 20, icon_h/2, 0xF0F0F0);
-    fill_rect(x + 18, y + icon_h/3 - 8, icon_w - 36, 8,        0xF0F0F0);
-}
-
-// 7-segment digit rendering ------------------------------------------
-
-static const uint8_t digit_mask[10] = {
-    0x77, // 0
-    0x24, // 1
-    0x5D, // 2
-    0x6D, // 3
-    0x2E, // 4
-    0x6B, // 5
-    0x7B, // 6
-    0x25, // 7
-    0x7F, // 8
-    0x6F  // 9
-};
-
-static void draw_digit7(uint32_t x, uint32_t y,
-                        uint32_t scale,
-                        uint8_t digit,
-                        uint32_t fg,
-                        uint32_t bg) {
-    if (digit > 9) digit = 0;
-
-    // overall cell background
-    uint32_t cell_w = 4 * scale;
-    uint32_t cell_h = 7 * scale;
-    fill_rect(x, y, cell_w, cell_h, bg);
-
-    uint8_t mask = digit_mask[digit];
-    uint32_t t = scale;          // thickness
-
-    // segments coordinates
+    // segments:
     // 0: top
     if (mask & (1 << 0)) {
         fill_rect(x + t, y, 2 * t, t, fg);
@@ -239,26 +84,303 @@ static void draw_digit7(uint32_t x, uint32_t y,
     }
 }
 
-static void draw_colon(uint32_t x, uint32_t y,
-                       uint32_t scale,
-                       uint32_t fg,
-                       uint32_t bg) {
-    uint32_t cell_w = 2 * scale;
-    uint32_t cell_h = 7 * scale;
-    fill_rect(x, y, cell_w, cell_h, bg);
-    uint32_t dot_size = scale;
-    fill_rect(x, y + 2 * scale, dot_size, dot_size, fg);
-    fill_rect(x, y + 5 * scale, dot_size, dot_size, fg);
+static uint8_t digit7_mask(int d) {
+    switch (d) {
+        case 0: return 0b0111111;
+        case 1: return 0b0000110;
+        case 2: return 0b1011011;
+        case 3: return 0b1001111;
+        case 4: return 0b1100110;
+        case 5: return 0b1101101;
+        case 6: return 0b1111101;
+        case 7: return 0b0000111;
+        case 8: return 0b1111111;
+        case 9: return 0b1101111;
+        default: return 0;
+    }
 }
 
-static void draw_dash(uint32_t x, uint32_t y,
-                      uint32_t scale,
-                      uint32_t fg,
-                      uint32_t bg) {
-    uint32_t cell_w = 4 * scale;
-    uint32_t cell_h = 7 * scale;
-    fill_rect(x, y, cell_w, cell_h, bg);
-    fill_rect(x + scale, y + 3 * scale, 2 * scale, scale, fg);
+// Draw a single digit 0–9
+static void draw_digit7(uint32_t x, uint32_t y, uint32_t scale, int d,
+                        uint32_t fg, uint32_t bg)
+{
+    draw_digit7_segments(x, y, scale, digit7_mask(d), fg, bg);
+}
+
+// Draw colon for HH:MM
+static void draw_colon(uint32_t x, uint32_t y, uint32_t scale,
+                       uint32_t fg, uint32_t bg)
+{
+    uint32_t w = 2 * scale;
+    uint32_t h = 7 * scale;
+    fill_rect(x, y, w, h, bg);
+
+    uint32_t dot = scale;
+    fill_rect(x,         y + 2 * scale, dot, dot, fg);
+    fill_rect(x,         y + 4 * scale, dot, dot, fg);
+}
+
+// Boot screen --------------------------------------------------------
+
+static void draw_spinner_frame(uint32_t cx, uint32_t cy, uint32_t radius,
+                               uint32_t active, uint32_t bg)
+{
+    // 8-dot spinner, one bright, others dim
+    const int8_t dx[8] = { 0,  1,  1,  1,  0, -1, -1, -1 };
+    const int8_t dy[8] = { -1, -1,  0,  1,  1,  1,  0, -1 };
+
+    uint32_t dot_size = radius / 3;
+    if (dot_size < 3) dot_size = 3;
+
+    // clear area
+    uint32_t box = radius * 2 + dot_size * 2;
+    fill_rect(cx - box/2, cy - box/2, box, box, bg);
+
+    for (uint32_t i = 0; i < 8; ++i) {
+        int32_t px = (int32_t)cx + (int32_t)dx[i] * (int32_t)radius;
+        int32_t py = (int32_t)cy + (int32_t)dy[i] * (int32_t)radius;
+        uint32_t col = (i == (active & 7)) ? 0xFFFFFF : 0x606070;
+        fill_rect((uint32_t)(px - (int32_t)(dot_size/2)),
+                  (uint32_t)(py - (int32_t)(dot_size/2)),
+                  dot_size, dot_size, col);
+    }
+}
+
+// Simple block letters for "LightOS 4"
+static void draw_letter_L(uint32_t x, uint32_t y,
+                          uint32_t w, uint32_t h, uint32_t c)
+{
+    uint32_t t = w / 5; if (t < 2) t = 2;
+    fill_rect(x, y, t, h, c);
+    fill_rect(x, y + h - t, w, t, c);
+}
+
+static void draw_letter_i(uint32_t x, uint32_t y,
+                          uint32_t w, uint32_t h, uint32_t c)
+{
+    uint32_t t = w / 6; if (t < 2) t = 2;
+    fill_rect(x + (w/2 - t/2), y + h/4, t, h*3/4, c);
+    fill_rect(x + (w/2 - t/2), y, t, t, c);
+}
+
+static void draw_letter_g(uint32_t x, uint32_t y,
+                          uint32_t w, uint32_t h, uint32_t c)
+{
+    uint32_t t = w / 5; if (t < 2) t = 2;
+    // big O
+    fill_rect(x + t, y,         w - 2*t, t, c);
+    fill_rect(x + t, y + h - t, w - 2*t, t, c);
+    fill_rect(x,     y + t,     t,       h - 2*t, c);
+    fill_rect(x + w - t, y + t, t,       h - 2*t, c);
+    // opening on right-bottom
+    fill_rect(x + w - t, y + h/2, t, h/2, 0);
+    // tail
+    fill_rect(x + w/2, y + h/2, t, h/2, c);
+}
+
+static void draw_letter_h(uint32_t x, uint32_t y,
+                          uint32_t w, uint32_t h, uint32_t c)
+{
+    uint32_t t = w / 6; if (t < 2) t = 2;
+    fill_rect(x, y, t, h, c);
+    fill_rect(x + w - t, y + h/3, t, 2*h/3, c);
+    fill_rect(x, y + h/3, w - t, t, c);
+}
+
+static void draw_letter_t(uint32_t x, uint32_t y,
+                          uint32_t w, uint32_t h, uint32_t c)
+{
+    uint32_t t = w / 5; if (t < 2) t = 2;
+    fill_rect(x, y, w, t, c);
+    fill_rect(x + w/2 - t/2, y, t, h, c);
+}
+
+static void draw_letter_O(uint32_t x, uint32_t y,
+                          uint32_t w, uint32_t h, uint32_t c)
+{
+    uint32_t t = w / 5; if (t < 2) t = 2;
+    fill_rect(x + t, y,         w - 2*t, t, c);
+    fill_rect(x + t, y + h - t, w - 2*t, t, c);
+    fill_rect(x,     y + t,     t,       h - 2*t, c);
+    fill_rect(x + w - t, y + t, t,       h - 2*t, c);
+}
+
+static void draw_letter_S(uint32_t x, uint32_t y,
+                          uint32_t w, uint32_t h, uint32_t c)
+{
+    uint32_t t = w / 5; if (t < 2) t = 2;
+    fill_rect(x + t, y,         w - 2*t, t, c);
+    fill_rect(x,     y + t,     t,       h/2 - t, c);
+    fill_rect(x + t, y + h/2 - t/2, w - 2*t, t, c);
+    fill_rect(x + w - t, y + h/2, t,       h/2 - t, c);
+    fill_rect(x + t, y + h - t,   w - 2*t, t, c);
+}
+
+static void draw_digit_4(uint32_t x, uint32_t y,
+                         uint32_t w, uint32_t h, uint32_t c)
+{
+    uint32_t t = w / 5; if (t < 2) t = 2;
+    fill_rect(x, y + h/3, w/2, t, c);
+    fill_rect(x + w/2 - t/2, y, t, h, c);
+    fill_rect(x, y, t, h/2, c);
+}
+
+static void draw_title_lightos4(uint32_t center_x, uint32_t y,
+                                uint32_t scale, uint32_t color)
+{
+    uint32_t w = 8 * scale;
+    uint32_t h = 14 * scale;
+    uint32_t space = 3 * scale;
+
+    // L i g h t O S [space] 4  -> 9 slots
+    uint32_t char_w_used = w;
+    uint32_t total_w = 0;
+    total_w += 7 * (char_w_used + space);  // "LightOS"
+    total_w += (w/2);                      // space
+    total_w += char_w_used;               // "4"
+
+    uint32_t x = (center_x > total_w/2) ? (center_x - total_w/2) : 0;
+
+    // L
+    draw_letter_L(x, y, w, h, color);
+    x += char_w_used + space;
+    // i
+    draw_letter_i(x, y, w, h, color);
+    x += char_w_used + space;
+    // g
+    draw_letter_g(x, y, w, h, color);
+    x += char_w_used + space;
+    // h
+    draw_letter_h(x, y, w, h, color);
+    x += char_w_used + space;
+    // t
+    draw_letter_t(x, y, w, h, color);
+    x += char_w_used + space;
+    // O
+    draw_letter_O(x, y, w, h, color);
+    x += char_w_used + space;
+    // S
+    draw_letter_S(x, y, w, h, color);
+    x += char_w_used + space;
+
+    // space
+    x += w/2;
+
+    // 4
+    draw_digit_4(x, y, w, h, color);
+}
+
+static void draw_boot_screen(void) {
+    const uint32_t bg           = 0x001020; // darkish blue
+    const uint32_t bulb_body    = 0xFFF7CC;
+    const uint32_t bulb_outline = 0xD0C080;
+    const uint32_t socket_col   = 0x404040;
+
+    uint32_t cx = g_width / 2;
+    uint32_t cy = g_height / 3;
+
+    // Animate for a fixed number of frames
+    for (uint32_t frame = 0; frame < 64; ++frame) {
+        // background
+        fill_rect(0, 0, g_width, g_height, bg);
+
+        // --- light bulb ---
+        uint32_t bulb_radius = g_height / 12;
+        if (bulb_radius < 40) bulb_radius = 40;
+
+        uint32_t bulb_cx = cx;
+        uint32_t bulb_cy = cy;
+
+        // circular-ish top (poor man's circle)
+        for (int32_t yy = -(int32_t)bulb_radius; yy <= (int32_t)bulb_radius; ++yy) {
+            for (int32_t xx = -(int32_t)bulb_radius; xx <= (int32_t)bulb_radius; ++xx) {
+                int32_t dx = xx;
+                int32_t dy = yy;
+                if (dx*dx + dy*dy <= (int32_t)bulb_radius*(int32_t)bulb_radius) {
+                    put_pixel(bulb_cx + dx, bulb_cy + dy, bulb_body);
+                }
+            }
+        }
+        // outline ring
+        for (int32_t yy = -(int32_t)bulb_radius; yy <= (int32_t)bulb_radius; ++yy) {
+            for (int32_t xx = -(int32_t)bulb_radius; xx <= (int32_t)bulb_radius; ++xx) {
+                int32_t dx = xx;
+                int32_t dy = yy;
+                int32_t d2 = dx*dx + dy*dy;
+                int32_t r2 = (int32_t)bulb_radius*(int32_t)bulb_radius;
+                int32_t inner = (int32_t)(bulb_radius - 2);
+                if (d2 <= r2 && d2 >= inner*inner) {
+                    put_pixel(bulb_cx + dx, bulb_cy + dy, bulb_outline);
+                }
+            }
+        }
+
+        // socket
+        uint32_t sock_w = bulb_radius * 2;
+        uint32_t sock_h = bulb_radius / 2;
+        if (sock_h < 16) sock_h = 16;
+        uint32_t sock_x = bulb_cx - sock_w/2;
+        uint32_t sock_y = bulb_cy + bulb_radius + 4;
+        fill_rect(sock_x, sock_y, sock_w, sock_h, socket_col);
+
+        // --- title "LightOS 4" ---
+        uint32_t title_y = sock_y + sock_h + 10;
+        draw_title_lightos4(cx, title_y, 2, 0xFFFFFF);
+
+        // --- spinner ---
+        uint32_t spin_y = title_y + 40;
+        uint32_t spin_radius = 18;
+        draw_spinner_frame(cx, spin_y, spin_radius, frame, bg);
+
+        // small busy-wait so frames are visible
+        for (volatile uint64_t wait = 0; wait < 15000000ULL; ++wait) {
+            __asm__ volatile("");
+        }
+    }
+}
+
+// Tray icons ---------------------------------------------------------
+
+static void draw_wifi_icon(uint32_t x, uint32_t y, uint32_t size) {
+    uint32_t bar_h = size / 5;
+    if (bar_h < 2) bar_h = 2;
+
+    fill_rect(x,              y + size - bar_h,      size / 4, bar_h, 0xFFFFFF);
+    fill_rect(x + size / 3,   y + size - 2 * bar_h,  size / 4, bar_h, 0xFFFFFF);
+    fill_rect(x + 2 * size/3, y + size - 3 * bar_h,  size / 4, bar_h, 0xFFFFFF);
+}
+
+static void draw_battery_icon(uint32_t x, uint32_t y, uint32_t w, uint32_t h,
+                              uint32_t level_color) {
+    uint32_t border = 2;
+    if (w < 6) w = 6;
+    if (h < 6) h = 6;
+
+    // border
+    fill_rect(x, y, w, h, 0xFFFFFF);
+    fill_rect(x + border, y + border,
+              w - 2 * border, h - 2 * border, 0x202020);
+
+    // fill (70% fake level)
+    uint32_t inner_w = w - 2 * border;
+    uint32_t fill_w  = (inner_w * 70) / 100;
+    fill_rect(x + border, y + border, fill_w, h - 2 * border,
+              level_color);
+
+    // positive terminal
+    uint32_t term_w = w / 8;
+    if (term_w < 2) term_w = 2;
+    fill_rect(x + w, y + h/3, term_w, h/3, 0xFFFFFF);
+}
+
+static void draw_speaker_icon(uint32_t x, uint32_t y, uint32_t size) {
+    // little square speaker + one "sound wave"
+    uint32_t box = size / 2;
+    if (box < 4) box = 4;
+
+    fill_rect(x, y + (size - box)/2, box, box, 0xFFFFFF);
+    fill_rect(x + box, y + (size - box)/2 + box/4,
+              box/2, box/2, 0xFFFFFF);
 }
 
 // draw a hard-coded time/date: "12:34" and "2026-01-19"
@@ -279,7 +401,7 @@ static void draw_time_date(uint32_t x, uint32_t y, uint32_t scale) {
     // 2
     draw_digit7(cursor, y, scale, 2, fg, bg);
     cursor += adv_digit;
-    // :
+    // colon
     draw_colon(cursor, y, scale, fg, bg);
     cursor += adv_colon;
     // 3
@@ -287,98 +409,182 @@ static void draw_time_date(uint32_t x, uint32_t y, uint32_t scale) {
     cursor += adv_digit;
     // 4
     draw_digit7(cursor, y, scale, 4, fg, bg);
+    cursor += adv_digit;
 
-    // ---- date under it: "2026-01-19" ----
-    uint32_t y2 = y + 8 * scale;
+    // small gap
+    cursor += adv_digit;
+
+    // ---- date "2026-01-19" ----
+    uint32_t date_y = y + 9 * scale;
     cursor = x;
 
-    // 2
-    draw_digit7(cursor, y2, scale, 2, fg, bg);
-    cursor += adv_digit;
-    // 0
-    draw_digit7(cursor, y2, scale, 0, fg, bg);
-    cursor += adv_digit;
-    // 2
-    draw_digit7(cursor, y2, scale, 2, fg, bg);
-    cursor += adv_digit;
-    // 6
-    draw_digit7(cursor, y2, scale, 6, fg, bg);
-    cursor += adv_digit;
-    // -
-    draw_dash(cursor, y2, scale, fg, bg);
-    cursor += adv_dash;
-    // 0
-    draw_digit7(cursor, y2, scale, 0, fg, bg);
-    cursor += adv_digit;
-    // 1
-    draw_digit7(cursor, y2, scale, 1, fg, bg);
-    cursor += adv_digit;
-    // -
-    draw_dash(cursor, y2, scale, fg, bg);
-    cursor += adv_dash;
-    // 1
-    draw_digit7(cursor, y2, scale, 1, fg, bg);
-    cursor += adv_digit;
-    // 9
-    draw_digit7(cursor, y2, scale, 9, fg, bg);
+    int digits[] = {2,0,2,6};
+    for (int i = 0; i < 4; ++i) {
+        draw_digit7(cursor, date_y, scale, digits[i], fg, bg);
+        cursor += adv_digit;
+    }
+
+    cursor += adv_space;
+
+    int month[] = {0,1};
+    for (int i = 0; i < 2; ++i) {
+        draw_digit7(cursor, date_y, scale, month[i], fg, bg);
+        cursor += adv_digit;
+    }
+
+    cursor += adv_space;
+
+    int day[] = {1,9};
+    for (int i = 0; i < 2; ++i) {
+        draw_digit7(cursor, date_y, scale, day[i], fg, bg);
+        cursor += adv_digit;
+    }
 }
 
-// Desktop composition ------------------------------------------------
+// App icons on the left side -----------------------------------------
+
+static void draw_app_icons(void) {
+    uint32_t icon_w = g_width / 16;
+    uint32_t icon_h = g_height / 10;
+    if (icon_w < 48) icon_w = 48;
+    if (icon_h < 48) icon_h = 48;
+
+    uint32_t gap = icon_h / 6;
+    uint32_t x = icon_w / 2;
+    uint32_t y = icon_h / 2;
+
+    uint32_t bg_panel   = 0x003366;
+    uint32_t icon_bg    = 0x234567;
+    uint32_t icon_fg    = 0xF0F0F0;
+    uint32_t folder_col = 0xFFD880;
+    uint32_t term_bg    = 0x000000;
+    uint32_t term_fg    = 0x00FF00;
+    uint32_t globe_bg   = 0x3399FF;
+    uint32_t store_bg   = 0xEEEEEE;
+    uint32_t store_fg   = 0x666666;
+
+    // left side background panel
+    fill_rect(0, 0, x + icon_w + gap, g_height, bg_panel);
+
+    // 1) Settings (gear-ish square)
+    fill_rect(x, y, icon_w, icon_h, icon_bg);
+    uint32_t gear_x = x + icon_w/4;
+    uint32_t gear_y = y + icon_h/4;
+    uint32_t gear_w = icon_w/2;
+    uint32_t gear_h = icon_h/2;
+    fill_rect(gear_x, gear_y, gear_w, gear_h, icon_fg);
+    fill_rect(gear_x + gear_w/4, gear_y + gear_h/4,
+              gear_w/2, gear_h/2, icon_bg);
+
+    y += icon_h + gap;
+
+    // 2) File Block (folder)
+    fill_rect(x, y, icon_w, icon_h, icon_bg);
+    uint32_t folder_x = x + icon_w/8;
+    uint32_t folder_y = y + icon_h/4;
+    uint32_t folder_w = icon_w * 3 / 4;
+    uint32_t folder_h = icon_h / 2;
+    fill_rect(folder_x, folder_y, folder_w, folder_h, folder_col);
+    fill_rect(folder_x, folder_y - folder_h/2,
+              folder_w/2, folder_h/2, folder_col);
+
+    y += icon_h + gap;
+
+    // 3) Command Block (terminal)
+    fill_rect(x, y, icon_w, icon_h, icon_bg);
+    uint32_t term_x = x + icon_w/8;
+    uint32_t term_y = y + icon_h/8;
+    uint32_t term_w = icon_w * 3/4;
+    uint32_t term_h = icon_h * 3/4;
+    fill_rect(term_x, term_y, term_w, term_h, term_bg);
+    // little green "prompt"
+    fill_rect(term_x + term_w/6, term_y + term_h/2,
+              term_w/6, term_h/12, term_fg);
+
+    y += icon_h + gap;
+
+    // 4) Browser (blue "globe")
+    fill_rect(x, y, icon_w, icon_h, icon_bg);
+    uint32_t globe_x = x + icon_w/2;
+    uint32_t globe_y = y + icon_h/2;
+    uint32_t r = icon_h/3;
+    for (int32_t yy = - (int32_t)r; yy <= (int32_t)r; ++yy) {
+        for (int32_t xx = - (int32_t)r; xx <= (int32_t)r; ++xx) {
+            if (xx*xx + yy*yy <= (int32_t)r*(int32_t)r) {
+                put_pixel(globe_x + xx, globe_y + yy, globe_bg);
+            }
+        }
+    }
+
+    y += icon_h + gap;
+
+    // 5) App Store (shopping bag)
+    fill_rect(x, y, icon_w, icon_h, icon_bg);
+    uint32_t bag_x = x + icon_w/6;
+    uint32_t bag_y = y + icon_h/4;
+    uint32_t bag_w = icon_w * 2/3;
+    uint32_t bag_h = icon_h / 2;
+    fill_rect(bag_x, bag_y, bag_w, bag_h, store_bg);
+    // handle
+    fill_rect(bag_x + bag_w/4, bag_y - bag_h/4,
+              bag_w/2, bag_h/6, store_bg);
+    fill_rect(bag_x + bag_w/4, bag_y - bag_h/4,
+              bag_w/8, bag_h/4, store_fg);
+    fill_rect(bag_x + bag_w*5/8, bag_y - bag_h/4,
+              bag_w/8, bag_h/4, store_fg);
+}
+
+// Desktop ------------------------------------------------------------
 
 static void draw_desktop(void) {
-    const uint32_t desktop_bg   = 0x003366;
-    const uint32_t taskbar_bg   = 0x202020;
-    const uint32_t tray_bg      = 0x303030;
-    const uint32_t window_border = 0x000000;
-    const uint32_t window_title  = 0x004080;
-    const uint32_t window_body   = 0xC0C0C0;
-    const uint32_t close_btn     = 0x800000;
+    uint32_t desktop_bg   = 0x003366;
+    uint32_t panel_bg     = 0x202020;
+    uint32_t panel_height = g_height / 12;
+    if (panel_height < 40) panel_height = 40;
 
-    // background
+    // desktop background
     fill_rect(0, 0, g_width, g_height, desktop_bg);
 
-    // taskbar at bottom
-    uint32_t taskbar_h = g_height / 14;
-    if (taskbar_h < 28) taskbar_h = 28;
-    uint32_t taskbar_y = g_height - taskbar_h;
-    fill_rect(0, taskbar_y, g_width, taskbar_h, taskbar_bg);
+    // bottom panel (taskbar)
+    uint32_t panel_y = g_height - panel_height;
+    fill_rect(0, panel_y, g_width, panel_height, panel_bg);
 
-    // start button (left)
-    uint32_t start_margin = 4;
-    uint32_t start_w = 90;
-    uint32_t start_h = taskbar_h - 2 * start_margin;
-    fill_rect(start_margin, taskbar_y + start_margin, start_w, start_h, 0x404040);
+    // left "start" block on the taskbar
+    uint32_t start_w = panel_height;
+    fill_rect(0, panel_y, start_w, panel_height, 0x404040);
 
-    // tray (right)
-    uint32_t tray_w = g_width / 5;
+    // right system tray region
+    uint32_t tray_w = g_width / 4;
     if (tray_w < 160) tray_w = 160;
-    uint32_t tray_x = g_width - tray_w - 4;
-    fill_rect(tray_x, taskbar_y + 2, tray_w, taskbar_h - 4, tray_bg);
+    uint32_t tray_x = g_width - tray_w;
+    fill_rect(tray_x, panel_y, tray_w, panel_height, 0x303030);
 
-    // tray icons
-    uint32_t size   = taskbar_h - 8;
-    if (size > tray_w / 4) size = tray_w / 4;
-    uint32_t icon_y = taskbar_y + 4;
-    uint32_t ix     = tray_x + 8;
+    // draw wifi, speaker, battery, time/date in tray
+    uint32_t icon_size = panel_height / 2;
+    if (icon_size < 16) icon_size = 16;
+    uint32_t icon_y = panel_y + (panel_height - icon_size) / 2;
 
-    draw_wifi_icon(ix, icon_y, size);
-    ix += size + 6;
-    draw_speaker_icon(ix, icon_y, size);
-    ix += size + 10;
-    draw_battery_icon(ix, icon_y + (size/4), size + 16, size / 2);
-    ix += size + 26;
+    uint32_t cursor_x = tray_x + tray_w - icon_size - 8;
+    draw_wifi_icon(cursor_x, icon_y, icon_size);
+    cursor_x -= icon_size + 8;
 
-    // time/date area
-    uint32_t remaining = (tray_x + tray_w) - ix - 4;
-    if (remaining > 0) {
-        fill_rect(ix, icon_y, remaining, size, 0x404040);
-        // draw static time/date in that area
-        uint32_t scale = (size / 7);
-        if (scale < 2) scale = 2;
-        uint32_t tx = ix + 4;
-        uint32_t ty = icon_y + 2;
-        draw_time_date(tx, ty, scale);
-    }
+    draw_speaker_icon(cursor_x, icon_y, icon_size);
+    cursor_x -= icon_size + 8;
+
+    draw_battery_icon(cursor_x, icon_y, icon_size * 3/2, icon_size,
+                      0x00FF00);
+    cursor_x -= icon_size * 2;
+
+    // time/date block
+    uint32_t clock_scale = icon_size / 4;
+    if (clock_scale < 2) clock_scale = 2;
+    uint32_t clock_w = 12 * clock_scale;
+    uint32_t clock_h = 16 * clock_scale;
+    uint32_t clock_x = tray_x + 8;
+    uint32_t clock_y = panel_y + (panel_height - clock_h) / 2;
+    fill_rect(clock_x - 2, clock_y - 2,
+              clock_w + 4, clock_h + 4, 0x404040);
+    draw_time_date(clock_x, clock_y, clock_scale);
 
     // app icons on desktop
     draw_app_icons();
@@ -389,6 +595,11 @@ static void draw_desktop(void) {
     uint32_t win_x = (g_width - win_w) / 2;
     uint32_t win_y = (g_height - win_h) / 2;
     if (win_y < 10) win_y = 10;
+
+    uint32_t window_border = 0x000000;
+    uint32_t window_title  = 0x004080;
+    uint32_t window_body   = 0xC0C0C0;
+    uint32_t close_btn     = 0x800000;
 
     // border
     fill_rect(win_x - 1, win_y - 1, win_w + 2, win_h + 2, window_border);
@@ -414,13 +625,8 @@ void kernel_main(BootInfo *bi) {
     g_height = bi->framebuffer_height;
     g_pitch  = bi->framebuffer_pitch;
 
-    // 1) Boot screen
+    // 1) Boot screen with animated spinner
     draw_boot_screen();
-
-    // crude delay so you can see the boot screen
-    for (volatile uint64_t i = 0; i < 500000000ULL; ++i) {
-        __asm__ volatile("");
-    }
 
     // 2) Desktop UI
     draw_desktop();
