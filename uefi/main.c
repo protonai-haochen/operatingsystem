@@ -1,6 +1,14 @@
 #include <efi.h>
 #include <efilib.h>
-#include <boot.h>  // shared BootInfo definition
+#include <stdint.h>
+
+// Must match kernel/include/boot.h
+typedef struct {
+    uint64_t framebuffer_base;
+    uint32_t framebuffer_width;
+    uint32_t framebuffer_height;
+    uint32_t framebuffer_pitch;   // pixels per scanline
+} BootInfo;
 
 #define KERNEL_PATH      L"\\kernel.bin"
 #define KERNEL_LOAD_ADDR 0x00100000ULL
@@ -137,14 +145,13 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     Print(L"[boot] Framebuffer @ 0x%lx (%ux%u, pitch %u)\r\n",
           fb_base, fb_width, fb_height, fb_pitch);
 
-    // --- 7. Prepare BootInfo for the kernel ---
+    // --- 7. Prepare BootInfo and jump to kernel ---
     BootInfo bi;
     bi.framebuffer_base   = fb_base;
     bi.framebuffer_width  = fb_width;
     bi.framebuffer_height = fb_height;
     bi.framebuffer_pitch  = fb_pitch;
 
-    // --- 8. Jump to kernel entry point ---
     kernel_entry_t entry = (kernel_entry_t)(UINTN)KERNEL_LOAD_ADDR;
 
     Print(L"[boot] Jumping to kernel at 0x%lx\r\n", (UINT64)KERNEL_LOAD_ADDR);
