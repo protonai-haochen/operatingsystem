@@ -886,3 +886,22 @@ void kernel_main(BootInfo *bi) {
     }
 }
 
+
+// ---------------------------------------------------------------------
+// Binary entry stub
+// This is placed in the .entry section at 0x00100000 and immediately
+// calls kernel_main(). The UEFI loader jumps here.
+// ---------------------------------------------------------------------
+
+__attribute__((noreturn, section(".entry")))
+void _start(BootInfo *bi) {
+    // Jump into the real kernel. This function should never return.
+    kernel_main(bi);
+
+    // Just in case, halt forever if it does.
+    for (;;) {
+        __asm__ volatile("hlt");
+    }
+}
+
+
