@@ -455,4 +455,434 @@ static void term_execute_command(TerminalState *t, const char *cmd_raw) {
     for (uint32_t i = 0; i < len && pos < TERM_MAX_COLS - 1; ++i) {
         echo_buf[pos++] = cmd[i];
     }
-    echo_buf[pos
+    echo_buf[pos] = '\0';
+    term_add_line(t, echo_buf);
+
+    // HELP
+    if (str_eq(cmd, "help")) {
+        term_add_line(t, "Supported commands:");
+        term_add_line(t, "  help");
+        term_add_line(t, "  cls / clear");
+        term_add_line(t, "  dir / ls");
+        term_add_line(t, "  ver / uname");
+        term_add_line(t, "  time, date");
+        term_add_line(t, "  echo <text>");
+        return;
+    }
+
+    // CLEAR
+    if (str_eq(cmd, "cls") || str_eq(cmd, "clear")) {
+        term_init(t);
+        return;
+    }
+
+    // DIR / LS (fake directory listing)
+    if (str_eq(cmd, "dir") || str_eq(cmd, "ls")) {
+        term_add_line(t, "Volume in drive C is LIGHTOS");
+        term_add_line(t, "Directory of C:/");
+        term_add_line(t, "  KERNEL   SYS");
+        term_add_line(t, "  BOOT     UEFI");
+        term_add_line(t, "  APPS     CMD");
+        term_add_line(t, "<no real filesystem yet>");
+        return;
+    }
+
+    // VER / UNAME
+    if (str_eq(cmd, "ver") || str_eq(cmd, "uname") || str_eq(cmd, "uname -a")) {
+        term_add_line(t, "LightOS 4 (kernel 0.1)");
+        term_add_line(t, "x86_64, single core, no MMU");
+        return;
+    }
+
+    // TIME / DATE (fake)
+    if (str_eq(cmd, "time")) {
+        term_add_line(t, "Current time: 12:34 (demo)");
+        return;
+    }
+    if (str_eq(cmd, "date")) {
+        term_add_line(t, "Current date: 2026-01-19 (demo)");
+        return;
+    }
+
+    // ECHO
+    if (str_starts_with(cmd, "echo")) {
+        const char *p = cmd + 4;
+        if (*p == ' ') ++p;
+        if (*p == '\0') term_add_line(t, "");
+        else            term_add_line(t, p);
+        return;
+    }
+
+    term_add_line(t, "Unknown command. Type 'help'.");
+}
+
+static void term_handle_scancode(uint8_t sc, TerminalState *t,
+                                 int *selected_icon, int *open_app) {
+    (void)selected_icon; // not used while inside Command Block
+
+    if (sc == 0xE0) return;      // ignore extended prefix for now
+    if (sc & 0x80) return;       // ignore key releases
+
+    if (sc == 0x01) {            // Esc: close Command Block
+        *open_app = -1;
+        return;
+    }
+
+    if (sc == 0x0E) {            // Backspace
+        if (t->input_len > 0) {
+            t->input_len--;
+            t->input[t->input_len] = '\0';
+        }
+        return;
+    }
+
+    if (sc == 0x1C) {            // Enter
+        t->input[t->input_len] = '\0';
+        term_execute_command(t, t->input);
+        t->input_len = 0;
+        t->input[0] = '\0';
+        return;
+    }
+
+    char ch = scancode_to_char(sc);
+    if (ch != 0 && t->input_len < TERM_MAX_COLS - 1) {
+        t->input[t->input_len++] = ch;
+        t->input[t->input_len]   = '\0';
+    }
+}
+
+// ---------------------------------------------------------------------
+// Desktop widgets & main window
+// ---------------------------------------------------------------------
+
+static void draw_wifi_icon(uint32_t x, uint32_t y, uint32_t size) {
+    uint32_t bar_h = size / 5;
+    if (bar_h < 2) bar_h = 2;
+
+    // Fake full signal bars
+    fill_rect(x,              y + size - bar_h,      size / 4, bar_h, 0xFFFFFF);
+    fill_rect(x + size / 3,   y + size - 2 * bar_h,  size / 4, bar_h, 0xFFFFFF);
+    fill_rect(x + 2*size / 3, y + size - 3 * bar_h,  size / 4, bar_h, 0xFFFFFF);
+}
+
+static void draw_battery_icon(uint32_t x, uint32_t y,
+                              uint32_t w, uint32_t h,
+                              uint32_t percent) {
+    if (w < 18) w = 18;
+    if (h < 8)  h = 8;
+    uint32_t border = 2;
+
+    // Frame
+    fill_rect(x, y, w, h, 0xFFFFFF);
+    fill_rect(x + border, y + border,
+              w - 2 * border, h - 2 * border, 0x202020);
+
+    if (percent > 100) percent = 100;
+    uint32_t inner_w = w - 2 * border;
+    uint32_t fill_w  = (inner_w * percent) / 100;
+    uint32_t color   = (percent < 25) ? 0xC00000 : 0x00C000;
+
+    fill_rect(x + border, y + border,
+              fill_w, h - 2 * border, color);
+
+    // Little nub
+    uint32_t nub_w = w / 8;
+    if (nub_w < 2) nub_w = 2;
+    fill_rect(x + w, y + h / 3, nub_w, h / 3, 0xFFFFFF);
+}
+
+static void draw_speaker_icon(uint32_t x, uint32_t y, uint32_t size) {
+    uint32_t box = size / 2;
+    if (box < 4) box = 4;
+    fill_rect(x, y + (size - box) / 2, box, box, 0xFFFFFF);
+    fill_rect(x + box, y + (size - box) / 2 + box / 4,
+              box / 2, box / 2, 0xFFFFFF);
+}
+
+static void draw_clock_box(uint32_t x, uint32_t y,
+                           uint32_t w, uint32_t h) {
+    // Static time/date placeholder
+    fill_rect(x, y, w, h, 0x404040);
+    draw_text(x + 4, y + 2,       "12:34",      0xFFFFFF, 1);
+    draw_text(x + 4, y + h / 2 + 1, "2026-01-19", 0xC0C0C0, 1);
+}
+
+// Left column: 5 app icons, with selection highlight
+static void draw_app_icons(int selected) {
+    uint32_t icon_w = g_width / 18;
+    uint32_t icon_h = g_height / 11;
+    if (icon_w < 40) icon_w = 40;
+    if (icon_h < 40) icon_h = 40;
+
+    uint32_t gap = icon_h / 5;
+    uint32_t x   = icon_w / 2;
+    uint32_t y   = icon_h / 2;
+
+    uint32_t panel_bg = 0x003366;
+    fill_rect(0, 0, x + icon_w + gap, g_height, panel_bg);
+
+    for (int idx = 0; idx < 5; ++idx) {
+        uint32_t bg = (idx == selected) ? 0x4C7AB5 : 0x234567;
+        fill_rect(x, y, icon_w, icon_h, bg);
+
+        uint32_t inner_x = x + icon_w / 8;
+        uint32_t inner_y = y + icon_h / 8;
+        uint32_t inner_w = icon_w * 3 / 4;
+        uint32_t inner_h = icon_h * 3 / 4;
+
+        switch (idx) {
+            case 0: // Settings
+                fill_rect(inner_x, inner_y, inner_w, inner_h, 0xE0E0E0);
+                fill_rect(inner_x + inner_w / 4, inner_y + inner_h / 4,
+                          inner_w / 2, inner_h / 2, bg);
+                break;
+            case 1: // File Block
+                fill_rect(inner_x, inner_y + inner_h / 4,
+                          inner_w, inner_h * 3 / 4, 0xFFE79C);
+                fill_rect(inner_x, inner_y,
+                          inner_w / 2, inner_h / 3, 0xFFE79C);
+                break;
+            case 2: // Command Block
+                fill_rect(inner_x, inner_y, inner_w, inner_h, 0x000000);
+                fill_rect(inner_x + inner_w / 6,
+                          inner_y + inner_h / 2,
+                          inner_w / 5, inner_h / 10, 0x00FF00);
+                break;
+            case 3: { // Browser (blue circle)
+                uint32_t cx = inner_x + inner_w / 2;
+                uint32_t cy = inner_y + inner_h / 2;
+                uint32_t r  = inner_h / 3;
+                for (int32_t yy = -(int32_t)r; yy <= (int32_t)r; ++yy) {
+                    for (int32_t xx = -(int32_t)r; xx <= (int32_t)r; ++xx) {
+                        if (xx * xx + yy * yy <= (int32_t)r * (int32_t)r) {
+                            put_pixel(cx + xx, cy + yy, 0x3399FF);
+                        }
+                    }
+                }
+                break;
+            }
+            case 4: // App Store
+                fill_rect(inner_x, inner_y + inner_h / 3,
+                          inner_w, inner_h * 2 / 3, 0xFFFFFF);
+                fill_rect(inner_x + inner_w / 4,
+                          inner_y + inner_h / 3 - inner_h / 5,
+                          inner_w / 2, inner_h / 5, 0xFFFFFF);
+                break;
+        }
+
+        y += icon_h + gap;
+    }
+}
+
+static void draw_terminal_contents(uint32_t win_x, uint32_t win_y,
+                                   uint32_t win_w, uint32_t win_h,
+                                   uint32_t title_h) {
+    uint32_t x = win_x + 10;
+    uint32_t y = win_y + title_h + 10;
+
+    for (uint32_t i = 0; i < g_term.line_count; ++i) {
+        draw_text(x, y, g_term.lines[i], 0xFFFFFF, 1);
+        y += 12;
+        if (y + 12 >= win_y + win_h) break;
+    }
+
+    // Prompt
+    if (y + 16 < win_y + win_h) {
+        char buf[TERM_MAX_COLS];
+        buf[0] = '>';
+        buf[1] = ' ';
+        uint32_t len = g_term.input_len;
+        if (len > TERM_MAX_COLS - 3) len = TERM_MAX_COLS - 3;
+        for (uint32_t i = 0; i < len; ++i) {
+            buf[2 + i] = g_term.input[i];
+        }
+        buf[2 + len] = '\0';
+        draw_text(x, y + 4, buf, 0x00FF00, 1);
+    }
+}
+
+static void draw_main_window(int open_app) {
+    uint32_t win_w = (g_width * 3) / 5;
+    uint32_t win_h = (g_height * 3) / 5;
+    uint32_t win_x = (g_width - win_w) / 2;
+    uint32_t win_y = (g_height - win_h) / 2;
+    if (win_y < 10) win_y = 10;
+
+    uint32_t border_col = 0x000000;
+    uint32_t title_col  = 0x004080;
+    uint32_t body_col   = 0xC0C0C0;
+
+    switch (open_app) {
+        case 0: body_col = 0xCCE8FF; title_col = 0x0055AA; break; // Settings
+        case 1: body_col = 0xFFF0C0; title_col = 0xAA7700; break; // File Block
+        case 2: body_col = 0x101010; title_col = 0x202020; break; // Command Block
+        case 3: body_col = 0xE0F4FF; title_col = 0x0066BB; break; // Browser
+        case 4: body_col = 0xF4E0FF; title_col = 0x664488; break; // App Store
+        default: break;
+    }
+
+    // Border
+    fill_rect(win_x - 1, win_y - 1, win_w + 2, win_h + 2, border_col);
+
+    // Title bar
+    uint32_t title_h = 28;
+    fill_rect(win_x, win_y, win_w, title_h, title_col);
+
+    // Window body
+    fill_rect(win_x, win_y + title_h, win_w, win_h - title_h, body_col);
+
+    // Close button (just visual)
+    uint32_t btn   = (title_h > 8) ? (title_h - 8) : (title_h / 2);
+    uint32_t btn_x = win_x + win_w - btn - 4;
+    uint32_t btn_y = win_y + (title_h - btn) / 2;
+    fill_rect(btn_x, btn_y, btn, btn, 0x800000);
+
+    // If Command Block is open, draw its content
+    if (open_app == 2) {
+        draw_terminal_contents(win_x, win_y, win_w, win_h, title_h);
+    }
+}
+
+static void draw_desktop(int selected_icon, int open_app) {
+    uint32_t desktop_bg = 0x003366;
+    uint32_t panel_bg   = 0x202020;
+
+    // Background
+    fill_rect(0, 0, g_width, g_height, desktop_bg);
+
+    // Taskbar
+    uint32_t panel_h = g_height / 12;
+    if (panel_h < 40) panel_h = 40;
+    uint32_t panel_y = g_height - panel_h;
+    fill_rect(0, panel_y, g_width, panel_h, panel_bg);
+
+    // Start block
+    uint32_t start_w = panel_h;
+    fill_rect(0, panel_y, start_w, panel_h, 0x404040);
+
+    // Tray
+    uint32_t tray_w = g_width / 4;
+    if (tray_w < 220) tray_w = 220;
+    uint32_t tray_x = g_width - tray_w;
+    fill_rect(tray_x, panel_y, tray_w, panel_h, 0x303030);
+
+    uint32_t icon_size = panel_h / 2;
+    if (icon_size < 16) icon_size = 16;
+    uint32_t icon_y = panel_y + (panel_h - icon_size) / 2;
+
+    uint32_t cursor_x = tray_x + tray_w - icon_size - 8;
+    draw_wifi_icon(cursor_x, icon_y, icon_size);
+    cursor_x -= icon_size + 8;
+
+    draw_speaker_icon(cursor_x, icon_y, icon_size);
+    cursor_x -= icon_size + 12;
+
+    draw_battery_icon(cursor_x, icon_y, icon_size * 3 / 2, icon_size, 76);
+    cursor_x -= icon_size * 2;
+
+    // Clock on left of tray
+    uint32_t clock_w = tray_w / 3;
+    uint32_t clock_h = icon_size + 10;
+    uint32_t clock_x = tray_x + 8;
+    uint32_t clock_y = panel_y + (panel_h - clock_h) / 2;
+    draw_clock_box(clock_x, clock_y, clock_w, clock_h);
+
+    // App icons + active window
+    draw_app_icons(selected_icon);
+    draw_main_window(open_app);
+}
+
+// ---------------------------------------------------------------------
+// Keyboard navigation (desktop-level)
+// ---------------------------------------------------------------------
+
+static void handle_nav_scancode(uint8_t sc,
+                                int *selected_icon,
+                                int *open_app) {
+    static uint8_t ext = 0;
+
+    if (sc == 0xE0) {
+        ext = 1;
+        return;
+    }
+
+    if (ext) {
+        uint8_t code = sc & 0x7F;
+        if (!(sc & 0x80)) {
+            switch (code) {
+                case 0x48: // Up
+                    if (*selected_icon > 0) (*selected_icon)--;
+                    else *selected_icon = 4;
+                    break;
+                case 0x50: // Down
+                    if (*selected_icon < 4) (*selected_icon)++;
+                    else *selected_icon = 0;
+                    break;
+                default:
+                    break;
+            }
+        }
+        ext = 0;
+        return;
+    }
+
+    if (sc & 0x80) return; // key release
+
+    switch (sc) {
+        case 0x1C: // Enter
+            *open_app = *selected_icon;
+            break;
+        case 0x01: // Esc
+            *open_app = -1;
+            break;
+        default:
+            break;
+    }
+}
+
+// ---------------------------------------------------------------------
+// Kernel entry
+// ---------------------------------------------------------------------
+
+__attribute__((noreturn))
+void kernel_main(BootInfo *bi) {
+    g_fb     = (uint32_t*)(uintptr_t)bi->framebuffer_base;
+    g_width  = bi->framebuffer_width;
+    g_height = bi->framebuffer_height;
+    g_pitch  = bi->framebuffer_pitch;
+
+    // 1) Boot splash
+    run_boot_splash();
+
+    // 2) Desktop + Command Block
+    term_init(&g_term);
+
+    int selected_icon = 0;   // 0..4
+    int open_app      = -1;  // -1 = nothing open
+
+    draw_desktop(selected_icon, open_app);
+
+    for (;;) {
+        uint8_t sc;
+        if (keyboard_poll(&sc)) {
+            int prev_sel  = selected_icon;
+            int prev_open = open_app;
+
+            if (open_app == 2) {
+                // Command Block takes over keyboard
+                term_handle_scancode(sc, &g_term, &selected_icon, &open_app);
+            } else {
+                // Desktop navigation
+                handle_nav_scancode(sc, &selected_icon, &open_app);
+            }
+
+            // Redraw when something changed, or while typing in Command Block
+            if (selected_icon != prev_sel ||
+                open_app      != prev_open ||
+                open_app == 2) {
+                draw_desktop(selected_icon, open_app);
+            }
+        }
+    }
+}
+
