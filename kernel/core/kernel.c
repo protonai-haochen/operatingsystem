@@ -1,7 +1,6 @@
 // LightOS 4 kernel
 // Simple UEFI framebuffer desktop + Command Block shell.
 // Uses BootInfo from boot.h and PS/2 keyboard polling.
-// No mouse, no real filesystem, no real RTC (all placeholders).
 
 #include <stdint.h>
 #include "boot.h"
@@ -16,7 +15,7 @@ static uint32_t  g_height = 0;
 static uint32_t  g_pitch  = 0;   // pixels per scanline
 
 // ---------------------------------------------------------------------
-// CPU / I/O helpers
+// Low-level I/O / keyboard
 // ---------------------------------------------------------------------
 
 static inline uint8_t inb(uint16_t port) {
@@ -73,7 +72,7 @@ static void fill_circle(uint32_t cx, uint32_t cy, uint32_t r, uint32_t color) {
 }
 
 // ---------------------------------------------------------------------
-// Tiny 8×8 bitmap font (only chars we need)
+// 8×8 bitmap font (ASCII-ish subset, lowercase auto-uppercased)
 // ---------------------------------------------------------------------
 
 typedef struct {
@@ -82,115 +81,73 @@ typedef struct {
 } Glyph8;
 
 static const Glyph8 FONT8[] = {
-    { 'L', { 0b10000000,
-             0b10000000,
-             0b10000000,
-             0b10000000,
-             0b10000000,
-             0b10000000,
-             0b11111110,
-             0 } },
-    { 'i', { 0b00100000,
-             0b00000000,
-             0b00100000,
-             0b00100000,
-             0b00100000,
-             0b00100000,
-             0b00000000,
-             0 } },
-    { 'g', { 0b00111100,
-             0b01000100,
-             0b01000100,
-             0b00111100,
-             0b00000100,
-             0b00111000,
-             0 } },
-    { 'h', { 0b10000000,
-             0b10000000,
-             0b10111000,
-             0b11000100,
-             0b10000100,
-             0b10000100,
-             0 } },
-    { 't', { 0b00100000,
-             0b00100000,
-             0b11111000,
-             0b00100000,
-             0b00100000,
-             0b00011000,
-             0 } },
-    { 'O', { 0b00111000,
-             0b01000100,
-             0b10000010,
-             0b10000010,
-             0b01000100,
-             0b00111000,
-             0 } },
-    { 'S', { 0b00111100,
-             0b01000000,
-             0b00111100,
-             0b00000010,
-             0b00000010,
-             0b00111100,
-             0 } },
-    { '4', { 0b00011000,
-             0b00101000,
-             0b01001000,
-             0b11111100,
-             0b00001000,
-             0b00001000,
-             0 } },
-    { ':', { 0b00000000,
-             0b00000000,
-             0b00110000,
-             0b00110000,
-             0b00000000,
-             0b00110000,
-             0b00110000,
-             0 } },
-    { '2', { 0b00111100,
-             0b01000010,
-             0b00001100,
-             0b00010000,
-             0b00100000,
-             0b01111110,
-             0 } },
-    { '3', { 0b00111100,
-             0b01000010,
-             0b00001100,
-             0b00000010,
-             0b01000010,
-             0b00111100,
-             0 } },
-    { '0', { 0b00111100,
-             0b01000010,
-             0b01000010,
-             0b01000010,
-             0b01000010,
-             0b00111100,
-             0 } },
-    { '6', { 0b00011100,
-             0b00100000,
-             0b01111100,
-             0b01000010,
-             0b01000010,
-             0b00111100,
-             0 } },
-    { '-', { 0b00000000,
-             0b00000000,
-             0b00000000,
-             0b01111110,
-             0b00000000,
-             0b00000000,
-             0 } },
     { ' ', { 0,0,0,0,0,0,0,0 } },
+    { '%', { 0b01000100,0b00001000,0b00010000,0b00010000,0b00100000,0b01000100,0,0 } },
+    { '\'', { 0b00010000,0b00010000,0,0,0,0,0,0 } },
+    { '(', { 0b00001000,0b00010000,0b00010000,0b00010000,0b00010000,0b00001000,0,0 } },
+    { ')', { 0b00100000,0b00010000,0b00010000,0b00010000,0b00010000,0b00100000,0,0 } },
+    { ',', { 0,0,0,0,0b00010000,0b00100000,0,0 } },
+    { '-', { 0,0,0,0b00111000,0,0,0,0 } },
+    { '.', { 0,0,0,0,0b00010000,0,0,0 } },
+    { '/', { 0b00000100,0b00001000,0b00010000,0b00010000,0b00100000,0b01000000,0,0 } },
+    { '0', { 0b00111000,0b00101000,0b00101100,0b00110100,0b00101000,0b00111000,0,0 } },
+    { '1', { 0b00010000,0b00110000,0b00010000,0b00010000,0b00010000,0b00111000,0,0 } },
+    { '2', { 0b00111000,0b00001000,0b00111000,0b00100000,0b00100000,0b00111000,0,0 } },
+    { '3', { 0b00111000,0b00001000,0b00011000,0b00001000,0b00001000,0b00111000,0,0 } },
+    { '4', { 0b00101000,0b00101000,0b00111000,0b00001000,0b00001000,0b00001000,0,0 } },
+    { '5', { 0b00111000,0b00100000,0b00111000,0b00001000,0b00001000,0b00111000,0,0 } },
+    { '6', { 0b00111000,0b00100000,0b00111000,0b00101000,0b00101000,0b00111000,0,0 } },
+    { '7', { 0b00111000,0b00001000,0b00001000,0b00010000,0b00100000,0b00100000,0,0 } },
+    { '8', { 0b00111000,0b00101000,0b00111000,0b00101000,0b00101000,0b00111000,0,0 } },
+    { '9', { 0b00111000,0b00101000,0b00101000,0b00111000,0b00001000,0b00111000,0,0 } },
+    { ':', { 0,0b00010000,0,0,0b00010000,0,0,0 } },
+    { '<', { 0b00001000,0b00010000,0b00100000,0b00010000,0b00001000,0,0,0 } },
+    { '>', { 0b00100000,0b00010000,0b00001000,0b00010000,0b00100000,0,0,0 } },
+    { 'A', { 0b00010000,0b00101000,0b00101000,0b00111000,0b00101000,0b00101000,0,0 } },
+    { 'B', { 0b00110000,0b00101000,0b00111000,0b00101000,0b00101000,0b00110000,0,0 } },
+    { 'C', { 0b00011000,0b00100100,0b00100000,0b00100000,0b00100100,0b00011000,0,0 } },
+    { 'D', { 0b00110000,0b00101000,0b00100100,0b00100100,0b00101000,0b00110000,0,0 } },
+    { 'E', { 0b00111000,0b00100000,0b00111000,0b00100000,0b00100000,0b00111000,0,0 } },
+    { 'F', { 0b00111000,0b00100000,0b00111000,0b00100000,0b00100000,0b00100000,0,0 } },
+    { 'G', { 0b00011000,0b00100100,0b00100000,0b00101100,0b00100100,0b00011100,0,0 } },
+    { 'H', { 0b00101000,0b00101000,0b00111000,0b00101000,0b00101000,0b00101000,0,0 } },
+    { 'I', { 0b00111000,0b00010000,0b00010000,0b00010000,0b00010000,0b00111000,0,0 } },
+    { 'J', { 0b00001000,0b00001000,0b00001000,0b00001000,0b00101000,0b00010000,0,0 } },
+    { 'K', { 0b00101000,0b00101000,0b00110000,0b00110000,0b00101000,0b00101000,0,0 } },
+    { 'L', { 0b00100000,0b00100000,0b00100000,0b00100000,0b00100000,0b00111000,0,0 } },
+    { 'M', { 0b00101000,0b00111000,0b00111000,0b00101000,0b00101000,0b00101000,0,0 } },
+    { 'N', { 0b00101000,0b00110100,0b00110100,0b00101100,0b00101100,0b00101000,0,0 } },
+    { 'O', { 0b00111000,0b00101000,0b00101000,0b00101000,0b00101000,0b00111000,0,0 } },
+    { 'P', { 0b00111000,0b00101000,0b00101000,0b00111000,0b00100000,0b00100000,0,0 } },
+    { 'Q', { 0b00111000,0b00101000,0b00101000,0b00101000,0b00110100,0b00111100,0,0 } },
+    { 'R', { 0b00111000,0b00101000,0b00101000,0b00111000,0b00110000,0b00101000,0,0 } },
+    { 'S', { 0b00011000,0b00100000,0b00110000,0b00011000,0b00001000,0b00110000,0,0 } },
+    { 'T', { 0b00111000,0b00010000,0b00010000,0b00010000,0b00010000,0b00010000,0,0 } },
+    { 'U', { 0b00101000,0b00101000,0b00101000,0b00101000,0b00101000,0b00111000,0,0 } },
+    { 'V', { 0b00101000,0b00101000,0b00101000,0b00101000,0b00010000,0b00010000,0,0 } },
+    { 'W', { 0b00101000,0b00101000,0b00101000,0b00111000,0b00111000,0b00101000,0,0 } },
+    { 'X', { 0b00101000,0b00101000,0b00010000,0b00010000,0b00101000,0b00101000,0,0 } },
+    { 'Y', { 0b00101000,0b00101000,0b00010000,0b00010000,0b00010000,0b00010000,0,0 } },
+    { 'Z', { 0b00111000,0b00001000,0b00010000,0b00010000,0b00100000,0b00111000,0,0 } },
+    { '_', { 0,0,0,0,0b00111000,0,0,0 } },
 };
 
+#define FONT8_COUNT (sizeof(FONT8) / sizeof(FONT8[0]))
+
 static const uint8_t* font_lookup(char c) {
-    for (unsigned i = 0; i < sizeof(FONT8)/sizeof(FONT8[0]); ++i) {
+    // Draw lowercase as uppercase
+    if (c >= 'a' && c <= 'z') {
+        c = (char)(c - 'a' + 'A');
+    }
+
+    for (unsigned i = 0; i < FONT8_COUNT; ++i) {
         if (FONT8[i].c == c) return FONT8[i].rows;
     }
-    return FONT8[sizeof(FONT8)/sizeof(FONT8[0]) - 1].rows; // space
+    // Fallback: space
+    for (unsigned i = 0; i < FONT8_COUNT; ++i) {
+        if (FONT8[i].c == ' ') return FONT8[i].rows;
+    }
+    return FONT8[0].rows;
 }
 
 static void draw_char(uint32_t x, uint32_t y,
@@ -227,25 +184,32 @@ static void draw_text(uint32_t x, uint32_t y,
 }
 
 // ---------------------------------------------------------------------
-// Boot splash: bulb + "LightOS 4" + spinner UNDER the text
+// Boot splash: bulb + "LightOS 4" + spinner *under* the text
 // ---------------------------------------------------------------------
 
 static void draw_bulb(uint32_t cx, uint32_t cy, uint32_t r,
                       uint32_t body, uint32_t outline, uint32_t base) {
     if (r < 32) r = 32;
 
-    // Circle
+    // Circular bulb
     fill_circle(cx, cy, r, outline);
     fill_circle(cx, cy, r - 3, body);
 
-    // Short base so text has room below
+    // Narrow neck
+    uint32_t neck_w = (r * 3) / 4;
+    uint32_t neck_h = r / 4;
+    if (neck_h < 8) neck_h = 8;
+    uint32_t neck_x = cx - neck_w / 2;
+    uint32_t neck_y = cy + r - neck_h / 2;
+    fill_rect(neck_x, neck_y, neck_w, neck_h, base);
+
+    // Wider base under the neck
     uint32_t base_w = (r * 4) / 3;
-    if (base_w < 32) base_w = 32;
+    if (base_w < neck_w + 8) base_w = neck_w + 8;
     uint32_t base_h = r / 3;
     if (base_h < 12) base_h = 12;
-
     uint32_t base_x = cx - base_w / 2;
-    uint32_t base_y = cy + r + 8;
+    uint32_t base_y = neck_y + neck_h + 4;
     fill_rect(base_x, base_y, base_w, base_h, base);
 }
 
@@ -258,7 +222,6 @@ static void draw_spinner_frame(uint32_t cx, uint32_t cy,
     uint32_t dot = radius / 3;
     if (dot < 3) dot = 3;
 
-    // Clear area around spinner
     uint32_t box = radius * 2 + dot * 2;
     fill_rect(cx - box / 2, cy - box / 2, box, box, bg);
 
@@ -283,52 +246,49 @@ static void run_boot_splash(void) {
     uint32_t cx = g_width  / 2;
     uint32_t cy = g_height / 3;
     uint32_t r  = g_height / 12;
-    if (r < 40) r = 40;
+    if (r < 48) r = 48;
 
+    // Draw bulb once for geometry reference
     draw_bulb(cx, cy, r, bulb_body, bulb_outline, bulb_base);
 
-    uint32_t text_scale = 3;
+    // Boot text
+    const char *title   = "LightOS 4";
+    uint32_t text_scale = 2;          // smaller = less Minecraft-y
     uint32_t text_h     = 8 * text_scale;
+    uint32_t text_chars = 9;
+    uint32_t text_w     = text_chars * 8 * text_scale;
 
+    // Approximate base bottom (bulb + neck + base)
     uint32_t base_h      = r / 3;
     if (base_h < 12) base_h = 12;
-    uint32_t base_bottom = cy + r + 8 + base_h;
+    uint32_t neck_h      = r / 4;
+    if (neck_h < 8) neck_h = 8;
+    uint32_t base_bottom = cy + r + neck_h + 4 + base_h;
 
-    uint32_t title_y = base_bottom + 16;       // BELOW bulb
-    uint32_t text_w  = 9 * 8 * text_scale;     // "LightOS 4"
-    uint32_t title_x = (cx > text_w / 2) ? cx - text_w / 2 : 0;
+    uint32_t title_y = base_bottom + 16;
+    uint32_t title_x = (cx > text_w / 2) ? (cx - text_w / 2) : 0;
 
-    uint32_t spinner_r = r / 2;
-    uint32_t spinner_y = title_y + text_h + 24; // CLEARLY under text
+    // Spinner well below text
+    uint32_t spinner_r = r / 3;
+    if (spinner_r < 16) spinner_r = 16;
+    uint32_t spinner_y = title_y + text_h + 40;
 
     for (uint32_t frame = 0; frame < 48; ++frame) {
         fill_rect(0, 0, g_width, g_height, bg);
         draw_bulb(cx, cy, r, bulb_body, bulb_outline, bulb_base);
-        draw_text(title_x, title_y, "LightOS 4", 0xFFFFFF, text_scale);
+        draw_text(title_x, title_y, title, 0xFFFFFF, text_scale);
         draw_spinner_frame(cx, spinner_y, spinner_r, frame, bg);
 
         // crude delay loop for animation
-        for (volatile uint64_t wait = 0; wait < 12000000ULL; ++wait) {
+        for (volatile uint64_t wait = 0; wait < 10000000ULL; ++wait) {
             __asm__ volatile("");
         }
     }
 }
 
 // ---------------------------------------------------------------------
-// Command Block terminal state
+// Simple string helpers
 // ---------------------------------------------------------------------
-
-#define TERM_MAX_LINES 32
-#define TERM_MAX_COLS  72
-
-typedef struct {
-    char     lines[TERM_MAX_LINES][TERM_MAX_COLS];
-    uint32_t line_count;
-    char     input[TERM_MAX_COLS];
-    uint32_t input_len;
-} TerminalState;
-
-static TerminalState g_term;
 
 static uint32_t str_len(const char *s) {
     uint32_t n = 0;
@@ -353,6 +313,22 @@ static int str_starts_with(const char *s, const char *prefix) {
     }
     return 1;
 }
+
+// ---------------------------------------------------------------------
+// Command Block terminal state
+// ---------------------------------------------------------------------
+
+#define TERM_MAX_LINES 32
+#define TERM_MAX_COLS  72
+
+typedef struct {
+    char     lines[TERM_MAX_LINES][TERM_MAX_COLS];
+    uint32_t line_count;
+    char     input[TERM_MAX_COLS];
+    uint32_t input_len;
+} TerminalState;
+
+static TerminalState g_term;
 
 static void term_add_line(TerminalState *t, const char *s) {
     if (!t) return;
@@ -559,7 +535,6 @@ static void draw_wifi_icon(uint32_t x, uint32_t y, uint32_t size) {
     uint32_t bar_h = size / 5;
     if (bar_h < 2) bar_h = 2;
 
-    // Fake full signal bars
     fill_rect(x,              y + size - bar_h,      size / 4, bar_h, 0xFFFFFF);
     fill_rect(x + size / 3,   y + size - 2 * bar_h,  size / 4, bar_h, 0xFFFFFF);
     fill_rect(x + 2*size / 3, y + size - 3 * bar_h,  size / 4, bar_h, 0xFFFFFF);
@@ -601,13 +576,12 @@ static void draw_speaker_icon(uint32_t x, uint32_t y, uint32_t size) {
 
 static void draw_clock_box(uint32_t x, uint32_t y,
                            uint32_t w, uint32_t h) {
-    // Static time/date placeholder
     fill_rect(x, y, w, h, 0x404040);
-    draw_text(x + 4, y + 2,       "12:34",      0xFFFFFF, 1);
-    draw_text(x + 4, y + h / 2 + 1, "2026-01-19", 0xC0C0C0, 1);
+    draw_text(x + 4, y + 2,        "12:34",      0xFFFFFF, 1);
+    draw_text(x + 4, y + h / 2 + 1,"2026-01-19", 0xC0C0C0, 1);
 }
 
-// Left column: 5 app icons, with selection highlight
+// Left column: 5 app icons
 static void draw_app_icons(int selected) {
     uint32_t icon_w = g_width / 18;
     uint32_t icon_h = g_height / 11;
@@ -702,6 +676,8 @@ static void draw_terminal_contents(uint32_t win_x, uint32_t win_y,
 }
 
 static void draw_main_window(int open_app) {
+    if (open_app < 0) return;
+
     uint32_t win_w = (g_width * 3) / 5;
     uint32_t win_h = (g_height * 3) / 5;
     uint32_t win_x = (g_width - win_w) / 2;
@@ -731,13 +707,12 @@ static void draw_main_window(int open_app) {
     // Window body
     fill_rect(win_x, win_y + title_h, win_w, win_h - title_h, body_col);
 
-    // Close button (just visual)
+    // Close button (visual only)
     uint32_t btn   = (title_h > 8) ? (title_h - 8) : (title_h / 2);
     uint32_t btn_x = win_x + win_w - btn - 4;
     uint32_t btn_y = win_y + (title_h - btn) / 2;
     fill_rect(btn_x, btn_y, btn, btn, 0x800000);
 
-    // If Command Block is open, draw its content
     if (open_app == 2) {
         draw_terminal_contents(win_x, win_y, win_w, win_h, title_h);
     }
@@ -780,20 +755,20 @@ static void draw_desktop(int selected_icon, int open_app) {
     draw_battery_icon(cursor_x, icon_y, icon_size * 3 / 2, icon_size, 76);
     cursor_x -= icon_size * 2;
 
-    // Clock on left of tray
+    // Clock
     uint32_t clock_w = tray_w / 3;
     uint32_t clock_h = icon_size + 10;
     uint32_t clock_x = tray_x + 8;
     uint32_t clock_y = panel_y + (panel_h - clock_h) / 2;
     draw_clock_box(clock_x, clock_y, clock_w, clock_h);
 
-    // App icons + active window
+    // App icons + window
     draw_app_icons(selected_icon);
     draw_main_window(open_app);
 }
 
 // ---------------------------------------------------------------------
-// Keyboard navigation (desktop-level)
+// Keyboard navigation on desktop (arrow keys, enter, esc)
 // ---------------------------------------------------------------------
 
 static void handle_nav_scancode(uint8_t sc,
@@ -857,7 +832,7 @@ void kernel_main(BootInfo *bi) {
     // 2) Desktop + Command Block
     term_init(&g_term);
 
-    int selected_icon = 0;   // 0..4
+    int selected_icon = 2;   // highlight Command Block by default
     int open_app      = -1;  // -1 = nothing open
 
     draw_desktop(selected_icon, open_app);
@@ -886,22 +861,16 @@ void kernel_main(BootInfo *bi) {
     }
 }
 
-
 // ---------------------------------------------------------------------
-// Binary entry stub
-// This is placed in the .entry section at 0x00100000 and immediately
-// calls kernel_main(). The UEFI loader jumps here.
+// Binary entry stub (lives in .entry at 0x00100000)
 // ---------------------------------------------------------------------
 
 __attribute__((noreturn, section(".entry")))
 void _start(BootInfo *bi) {
-    // Jump into the real kernel. This function should never return.
     kernel_main(bi);
 
-    // Just in case, halt forever if it does.
+    // If it ever returns, just halt forever
     for (;;) {
         __asm__ volatile("hlt");
     }
 }
-
-
