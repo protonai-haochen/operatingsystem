@@ -2,8 +2,15 @@ ENTRY(kernel_main)
 
 SECTIONS
 {
+    /* Kernel is loaded at 1 MiB */
     . = 0x00100000;
 
+    /* Put kernel_main at the very beginning in its own section */
+    .entry ALIGN(4K) : {
+        *(.entry)
+    }
+
+    /* All other code follows */
     .text ALIGN(4K) : {
         *(.text*)
     }
