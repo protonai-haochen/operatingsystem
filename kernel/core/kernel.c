@@ -1,5 +1,5 @@
 // kernel/core/kernel.c
-// LightOS 4 kernel: UEFI framebuffer desktop + basic keyboard input.
+// LightOS 4 kernel: UEFI framebuffer desktop + boot logo + basic keyboard.
 
 #include <stdint.h>
 #include "boot.h"
@@ -72,124 +72,187 @@ static void fill_circle(uint32_t cx, uint32_t cy, uint32_t r, uint32_t color) {
 }
 
 // ---------------------------------------------------------------------
+// Tiny 8×8 bitmap font for boot text + tray text
+// Only includes chars we actually use: L i g h t O S 4 space
+// ---------------------------------------------------------------------
+
+typedef struct {
+    char c;
+    uint8_t rows[8];
+} Glyph8;
+
+static const Glyph8 FONT8[] = {
+    // 'L'
+    { 'L', {
+        0b10000000,
+        0b10000000,
+        0b10000000,
+        0b10000000,
+        0b10000000,
+        0b10000000,
+        0b11111110,
+        0b00000000
+    }},
+    // 'i'
+    { 'i', {
+        0b00000000,
+        0b00100000,
+        0b00000000,
+        0b00100000,
+        0b00100000,
+        0b00100000,
+        0b00100000,
+        0b00000000
+    }},
+    // 'g'
+    { 'g', {
+        0b00000000,
+        0b00111100,
+        0b01000100,
+        0b01000100,
+        0b00111100,
+        0b00000100,
+        0b00111000,
+        0b00000000
+    }},
+    // 'h'
+    { 'h', {
+        0b10000000,
+        0b10000000,
+        0b10111000,
+        0b11000100,
+        0b10000100,
+        0b10000100,
+        0b10000100,
+        0b00000000
+    }},
+    // 't'
+    { 't', {
+        0b00100000,
+        0b00100000,
+        0b11111000,
+        0b00100000,
+        0b00100000,
+        0b00100000,
+        0b00011000,
+        0b00000000
+    }},
+    // 'O'
+    { 'O', {
+        0b00111000,
+        0b01000100,
+        0b10000010,
+        0b10000010,
+        0b10000010,
+        0b01000100,
+        0b00111000,
+        0b00000000
+    }},
+    // 'S'
+    { 'S', {
+        0b00111100,
+        0b01000000,
+        0b01000000,
+        0b00111100,
+        0b00000010,
+        0b00000010,
+        0b00111100,
+        0b00000000
+    }},
+    // '4'
+    { '4', {
+        0b00011000,
+        0b00101000,
+        0b01001000,
+        0b11111100,
+        0b00001000,
+        0b00001000,
+        0b00001000,
+        0b00000000
+    }},
+    // space
+    { ' ', {
+        0,0,0,0,0,0,0,0
+    }},
+};
+
+static const uint8_t* glyph_for(char c) {
+    for (unsigned i = 0; i < sizeof(FONT8)/sizeof(FONT8[0]); ++i) {
+        if (FONT8[i].c == c) return FONT8[i].rows;
+    }
+    // unknown -> blank
+    return FONT8[sizeof(FONT8)/sizeof(FONT8[0]) - 1].rows; // space
+}
+
+static void draw_char8(uint32_t x, uint32_t y,
+                       char c, uint32_t color)
+{
+    const uint8_t *rows = glyph_for(c);
+    for (uint32_t row = 0; row < 8; ++row) {
+        uint8_t bits = rows[row];
+        for (uint32_t col = 0; col < 8; ++col) {
+            if (bits & (0x80 >> col)) {
+                put_pixel(x + col, y + row, color);
+            }
+        }
+    }
+}
+
+static void draw_text(uint32_t x, uint32_t y,
+                      const char *s, uint32_t color, uint32_t scale)
+{
+    uint32_t cx = x;
+    uint32_t cy = y;
+    while (*s) {
+        if (*s == '\n') {
+            cx  = x;
+            cy += 8 * scale + 2;
+            ++s;
+            continue;
+        }
+        // draw scaled char
+        const uint8_t *rows = glyph_for(*s);
+        for (uint32_t row = 0; row < 8; ++row) {
+            uint8_t bits = rows[row];
+            for (uint32_t col = 0; col < 8; ++col) {
+                if (bits & (0x80 >> col)) {
+                    for (uint32_t dy = 0; dy < scale; ++dy) {
+                        for (uint32_t dx = 0; dx < scale; ++dx) {
+                            put_pixel(cx + col*scale + dx,
+                                      cy + row*scale + dy,
+                                      color);
+                        }
+                    }
+                }
+            }
+        }
+        cx += 8 * scale;
+        ++s;
+    }
+}
+
+// ---------------------------------------------------------------------
 // Boot splash: light bulb + "LightOS 4" + spinner
 // ---------------------------------------------------------------------
 
 static void draw_bulb(uint32_t cx, uint32_t cy, uint32_t r,
                       uint32_t body, uint32_t outline, uint32_t base)
 {
-    if (r < 8) r = 8;
+    if (r < 16) r = 16;
 
-    // ring outline + inner body
+    // bulb
     fill_circle(cx, cy, r, outline);
-    if (r > 2) {
-        fill_circle(cx, cy, r - 2, body);
-    }
+    if (r > 3) fill_circle(cx, cy, r - 3, body);
 
     // base / socket
     uint32_t base_w = (r * 4) / 3;
-    if (base_w < 20) base_w = 20;
+    if (base_w < 24) base_w = 24;
     uint32_t base_h = r / 2;
-    if (base_h < 8) base_h = 8;
+    if (base_h < 10) base_h = 10;
+
     uint32_t base_x = cx - base_w / 2;
     uint32_t base_y = cy + r + 4;
     fill_rect(base_x, base_y, base_w, base_h, base);
-}
-
-// crude block letters for "LightOS 4". Not pretty, but readable.
-static void draw_letter_L(uint32_t x, uint32_t y,
-                          uint32_t w, uint32_t h, uint32_t c) {
-    uint32_t t = w / 5; if (t < 2) t = 2;
-    fill_rect(x, y, t, h, c);
-    fill_rect(x, y + h - t, w, t, c);
-}
-
-static void draw_letter_i(uint32_t x, uint32_t y,
-                          uint32_t w, uint32_t h, uint32_t c) {
-    uint32_t t = w / 6; if (t < 2) t = 2;
-    fill_rect(x + w/2 - t/2, y + h/4, t, h*3/4, c);
-    fill_rect(x + w/2 - t/2, y, t, t, c);
-}
-
-static void draw_letter_g(uint32_t x, uint32_t y,
-                          uint32_t w, uint32_t h, uint32_t c) {
-    uint32_t t = w / 5; if (t < 2) t = 2;
-    // outer O
-    fill_rect(x + t,     y,         w - 2*t, t, c);
-    fill_rect(x + t,     y + h - t, w - 2*t, t, c);
-    fill_rect(x,         y + t,     t,       h - 2*t, c);
-    fill_rect(x + w - t, y + t,     t,       h - 2*t, c);
-    // cut on right bottom
-    fill_rect(x + w - t, y + h/2, t, h/2, 0x000000);
-    // tail
-    fill_rect(x + w/2, y + h/2, t, h/2, c);
-}
-
-static void draw_letter_h(uint32_t x, uint32_t y,
-                          uint32_t w, uint32_t h, uint32_t c) {
-    uint32_t t = w / 6; if (t < 2) t = 2;
-    fill_rect(x, y, t, h, c);
-    fill_rect(x + w - t, y + h/3, t, 2*h/3, c);
-    fill_rect(x, y + h/3, w - t, t, c);
-}
-
-static void draw_letter_t(uint32_t x, uint32_t y,
-                          uint32_t w, uint32_t h, uint32_t c) {
-    uint32_t t = w / 5; if (t < 2) t = 2;
-    fill_rect(x, y, w, t, c);
-    fill_rect(x + w/2 - t/2, y, t, h, c);
-}
-
-static void draw_letter_O(uint32_t x, uint32_t y,
-                          uint32_t w, uint32_t h, uint32_t c) {
-    uint32_t t = w / 5; if (t < 2) t = 2;
-    fill_rect(x + t,     y,         w - 2*t, t, c);
-    fill_rect(x + t,     y + h - t, w - 2*t, t, c);
-    fill_rect(x,         y + t,     t,       h - 2*t, c);
-    fill_rect(x + w - t, y + t,     t,       h - 2*t, c);
-}
-
-static void draw_letter_S(uint32_t x, uint32_t y,
-                          uint32_t w, uint32_t h, uint32_t c) {
-    uint32_t t = w / 5; if (t < 2) t = 2;
-    fill_rect(x + t,     y,         w - 2*t, t, c);
-    fill_rect(x,         y + t,     t,       h/2 - t, c);
-    fill_rect(x + t,     y + h/2 - t/2, w - 2*t, t, c);
-    fill_rect(x + w - t, y + h/2,  t,       h/2 - t, c);
-    fill_rect(x + t,     y + h - t, w - 2*t, t, c);
-}
-
-static void draw_digit_4(uint32_t x, uint32_t y,
-                         uint32_t w, uint32_t h, uint32_t c) {
-    uint32_t t = w / 5; if (t < 2) t = 2;
-    fill_rect(x, y + h/3, w/2, t, c);
-    fill_rect(x + w/2 - t/2, y, t, h, c);
-    fill_rect(x, y, t, h/2, c);
-}
-
-static void draw_title_lightos4(uint32_t center_x, uint32_t y,
-                                uint32_t scale, uint32_t color)
-{
-    uint32_t w = 8 * scale;
-    uint32_t h = 14 * scale;
-    uint32_t space = 3 * scale;
-
-    // L i g h t O S [gap] 4
-    uint32_t total = 0;
-    total += 7 * (w + space); // "LightOS"
-    total += w;               // small gap
-    total += w;               // "4"
-
-    uint32_t x = (center_x > total/2) ? center_x - total/2 : 0;
-
-    draw_letter_L(x, y, w, h, color); x += w + space;
-    draw_letter_i(x, y, w, h, color); x += w + space;
-    draw_letter_g(x, y, w, h, color); x += w + space;
-    draw_letter_h(x, y, w, h, color); x += w + space;
-    draw_letter_t(x, y, w, h, color); x += w + space;
-    draw_letter_O(x, y, w, h, color); x += w + space;
-    draw_letter_S(x, y, w, h, color); x += w + space + w;
-    draw_digit_4(x, y, w, h, color);
 }
 
 // 8-dot spinner
@@ -203,7 +266,7 @@ static void draw_spinner_frame(uint32_t cx, uint32_t cy,
     uint32_t dot = radius / 3;
     if (dot < 3) dot = 3;
 
-    // clear local area
+    // clear region
     uint32_t box = radius * 2 + dot * 2;
     fill_rect(cx - box/2, cy - box/2, box, box, bg);
 
@@ -228,18 +291,25 @@ static void draw_boot_sequence(void) {
     uint32_t r  = g_height / 12;
     if (r < 40) r = 40;
 
-    uint32_t title_y = cy + r + r/4 + 10;
-    uint32_t spin_y  = title_y + 40;
-    uint32_t spin_r  = r / 2;
+    // positions: bulb center at (cx,cy)
+    // text below bulb + base
+    uint32_t text_scale = 3;
+    uint32_t text_h     = 8 * text_scale;
+    uint32_t title_y    = cy + r + 20;
+    uint32_t text_w     = 9 * 8 * text_scale; // "LightOS 4" = 9 chars
+    uint32_t title_x    = (cx > text_w/2) ? cx - text_w/2 : 0;
+
+    uint32_t spinner_r  = r / 2;
+    uint32_t spinner_y  = title_y + text_h + 20; // moved well under text
 
     for (uint32_t frame = 0; frame < 48; ++frame) {
-        // clear + bulb + title every frame
         fill_rect(0, 0, g_width, g_height, bg);
-        draw_bulb(cx, cy, r, bulb_body, bulb_outline, bulb_base);
-        draw_title_lightos4(cx, title_y, 2, 0xFFFFFF);
-        draw_spinner_frame(cx, spin_y, spin_r, frame, bg);
 
-        // crude delay so animation is visible
+        draw_bulb(cx, cy, r, bulb_body, bulb_outline, bulb_base);
+        draw_text(title_x, title_y, "LightOS 4", 0xFFFFFF, text_scale);
+        draw_spinner_frame(cx, spinner_y, spinner_r, frame, bg);
+
+        // crude delay per frame
         for (volatile uint64_t wait = 0; wait < 15000000ULL; ++wait) {
             __asm__ volatile("");
         }
@@ -263,18 +333,15 @@ static void draw_battery_icon(uint32_t x, uint32_t y,
     if (h < 6)  h = 6;
     uint32_t border = 2;
 
-    // shell
     fill_rect(x, y, w, h, 0xFFFFFF);
     fill_rect(x + border, y + border,
               w - 2*border, h - 2*border, 0x202020);
 
-    // 80% fill
     uint32_t inner_w = w - 2*border;
     uint32_t fill_w  = inner_w * 4 / 5;
     fill_rect(x + border, y + border,
               fill_w, h - 2*border, 0x00C000);
 
-    // nub
     uint32_t nub_w = w / 8; if (nub_w < 2) nub_w = 2;
     fill_rect(x + w, y + h/3, nub_w, h/3, 0xFFFFFF);
 }
@@ -288,31 +355,29 @@ static void draw_speaker_icon(uint32_t x, uint32_t y, uint32_t size) {
 
 static void draw_clock_box(uint32_t x, uint32_t y,
                            uint32_t w, uint32_t h) {
-    // just a placeholder box representing time+date
     fill_rect(x, y, w, h, 0x404040);
-    // "time" bar
-    fill_rect(x + 4, y + 4, w - 8, h/3, 0xE0E0E0);
-    // "date" bar
-    fill_rect(x + 4, y + h/2, w - 8, h/3, 0xC0C0C0);
+    // top line: time string
+    draw_text(x + 4, y + 2, "12:34", 0xFFFFFF, 1);
+    // bottom line: date string
+    draw_text(x + 4, y + h/2, "2026-01-19", 0xC0C0C0, 1);
 }
 
 // Left column of app icons; 'selected' gets a brighter frame.
 static void draw_app_icons(int selected) {
-    uint32_t icon_w = g_width / 16;
-    uint32_t icon_h = g_height / 10;
-    if (icon_w < 48) icon_w = 48;
-    if (icon_h < 48) icon_h = 48;
+    uint32_t icon_w = g_width / 18;
+    uint32_t icon_h = g_height / 11;
+    if (icon_w < 40) icon_w = 40;
+    if (icon_h < 40) icon_h = 40;
 
-    uint32_t gap = icon_h / 6;
-    uint32_t x = icon_w / 2;
-    uint32_t y = icon_h / 2;
+    uint32_t gap = icon_h / 5;
+    uint32_t x   = icon_w / 2;
+    uint32_t y   = icon_h / 2;
 
     uint32_t panel_bg = 0x003366;
     fill_rect(0, 0, x + icon_w + gap, g_height, panel_bg);
 
-    // For each icon, base bg depends on selection
     for (int idx = 0; idx < 5; ++idx) {
-        uint32_t bg = (idx == selected) ? 0x355C8F : 0x234567;
+        uint32_t bg = (idx == selected) ? 0x4C7AB5 : 0x234567;
         fill_rect(x, y, icon_w, icon_h, bg);
 
         uint32_t inner_x = x + icon_w / 8;
@@ -440,12 +505,12 @@ static void draw_desktop(int selected_icon, int open_app) {
 
     // clock box on left side of tray
     uint32_t clock_w = tray_w / 3;
-    uint32_t clock_h = icon_size;
+    uint32_t clock_h = icon_size + 6;
     uint32_t clock_x = tray_x + 8;
     uint32_t clock_y = panel_y + (panel_h - clock_h)/2;
     draw_clock_box(clock_x, clock_y, clock_w, clock_h);
 
-    // app icons and main window
+    // app icons + main window
     draw_app_icons(selected_icon);
     draw_main_window(open_app);
 }
@@ -466,8 +531,7 @@ static void handle_scancode(uint8_t sc,
     }
 
     if (ext) {
-        // Extended scancodes (arrows): E0 48, E0 50
-        uint8_t code = sc & 0x7F; // ignore key-release high bit
+        uint8_t code = sc & 0x7F;
         if (!(sc & 0x80)) {
             switch (code) {
                 case 0x48: // Up
@@ -486,11 +550,7 @@ static void handle_scancode(uint8_t sc,
         return;
     }
 
-    // Non-extended
-    if (sc & 0x80) {
-        // key release – ignore
-        return;
-    }
+    if (sc & 0x80) return; // key release
 
     switch (sc) {
         case 0x1C: // Enter
@@ -515,12 +575,12 @@ void kernel_main(BootInfo *bi) {
     g_height = bi->framebuffer_height;
     g_pitch  = bi->framebuffer_pitch;
 
-    // 1) Boot animation: light bulb + "LightOS 4" + spinner
+    // 1) Boot animation: light bulb + "LightOS 4" + spinner (no overlap)
     draw_boot_sequence();
 
     // 2) Desktop + basic keyboard loop
     int selected_icon = 0;   // 0..4
-    int open_app      = -1;  // -1 = generic / no app
+    int open_app      = -1;  // -1 = neutral
 
     draw_desktop(selected_icon, open_app);
 
@@ -536,7 +596,6 @@ void kernel_main(BootInfo *bi) {
                 draw_desktop(selected_icon, open_app);
             }
         }
-        // simple spin; if you want less CPU usage you can add a tiny
-        // dummy loop here or occasionally call hlt().
+        // (Optional) add hlt() occasionally to save CPU.
     }
 }
