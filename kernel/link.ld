@@ -1,11 +1,11 @@
-ENTRY(kernel_main)
+ENTRY(_start)
 
 SECTIONS
 {
     /* Kernel is loaded at 1 MiB */
     . = 0x00100000;
 
-    /* Put kernel_main at the very beginning in its own section */
+    /* Put _start at the very beginning in its own section */
     .entry ALIGN(4K) : {
         *(.entry)
     }
