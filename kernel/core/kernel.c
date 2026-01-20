@@ -1528,57 +1528,50 @@ static void draw_desktop(int selected_icon, int open_app) {
 }
 
 // ---------------------------------------------------------------------
-// Keyboard nav (desktop side)
+// Keyboard nav (desktop side) – ARROW KEYS now move the cursor
 // ---------------------------------------------------------------------
 
 static void handle_nav_scancode(uint8_t sc,
                                 int *selected_icon,
                                 int *open_app) {
-    if (sc & 0x80) return; // ignore releases (Shift handled separately in terminal)
+    if (sc & 0x80) return; // ignore releases (Shift handled in terminal)
 
-    // Up / Down arrows change selection
-    if (sc == 0x48) {            // Up
+    int32_t dx = 0;
+    int32_t dy = 0;
+
+    // Arrow keys: change selection + move cursor
+    if (sc == 0x48) {            // Up arrow
         if (*selected_icon > 0) (*selected_icon)--;
-        return;
-    }
-    if (sc == 0x50) {            // Down
+        dy = -8;
+    } else if (sc == 0x50) {     // Down arrow
         if (*selected_icon < 4) (*selected_icon)++;
-        return;
-    }
-
-    // 'S' toggles start menu when on desktop
-    if (sc == 0x1F) {            // 's'
+        dy = 8;
+    } else if (sc == 0x4B) {     // Left arrow
+        dx = -8;
+    } else if (sc == 0x4D) {     // Right arrow
+        dx = 8;
+    } else if (sc == 0x1F) {     // 's' -> toggle Start
         g_start_open = !g_start_open;
         return;
-    }
-
-    // Enter opens app from dock
-    if (sc == 0x1C) {            // Enter
+    } else if (sc == 0x1C) {     // Enter: open selected app
         if (*selected_icon >= 0 && *selected_icon <= 4) {
             *open_app = *selected_icon;
             if (*open_app == 2) term_reset(&g_term);
         }
         return;
-    }
-
-    // Esc closes app
-    if (sc == 0x01) {
+    } else if (sc == 0x01) {     // Esc: close app
         *open_app = -1;
         return;
     }
 
-    // WASD moves mouse cursor (until real hardware mouse exists)
-    int32_t dx = 0, dy = 0;
-    if (sc == 0x11) dx = -8;        // W -> left
-    if (sc == 0x12) dy = -8;        // E -> up
-    if (sc == 0x1E) dx = 8;         // A -> right
-    if (sc == 0x20) dy = 8;         // D -> down
-    g_mouse.x += dx;
-    g_mouse.y += dy;
-    if (g_mouse.x < 0) g_mouse.x = 0;
-    if (g_mouse.y < 0) g_mouse.y = 0;
-    if ((uint32_t)g_mouse.x >= g_width)  g_mouse.x = (int32_t)g_width - 1;
-    if ((uint32_t)g_mouse.y >= g_height) g_mouse.y = (int32_t)g_height - 1;
+    if (dx != 0 || dy != 0) {
+        g_mouse.x += dx;
+        g_mouse.y += dy;
+        if (g_mouse.x < 0) g_mouse.x = 0;
+        if (g_mouse.y < 0) g_mouse.y = 0;
+        if ((uint32_t)g_mouse.x >= g_width)  g_mouse.x = (int32_t)g_width - 1;
+        if ((uint32_t)g_mouse.y >= g_height) g_mouse.y = (int32_t)g_height - 1;
+    }
 }
 
 // ---------------------------------------------------------------------
