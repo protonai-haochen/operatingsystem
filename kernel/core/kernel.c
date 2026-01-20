@@ -225,15 +225,6 @@ static int str_eq(const char *a, const char *b) {
     return (*a == '\0' && *b == '\0');
 }
 
-static int str_starts_with(const char *s, const char *prefix) {
-    if (!s || !prefix) return 0;
-    while (*prefix) {
-        if (*s != *prefix) return 0;
-        ++s; ++prefix;
-    }
-    return 1;
-}
-
 // Skip leading spaces
 static const char *skip_spaces(const char *p) {
     while (*p == ' ' || *p == '\t') ++p;
@@ -288,7 +279,7 @@ static void format_date(char *buf, uint32_t max) {
 }
 
 // ---------------------------------------------------------------------
-// Boot splash
+// Boot splash (no trig / libm)
 // ---------------------------------------------------------------------
 
 static void run_boot_splash(void) {
@@ -303,16 +294,22 @@ static void run_boot_splash(void) {
     // Spinner under the name, not overlapping
     uint32_t cx = g_width / 2;
     uint32_t cy = y + 80;
-    uint32_t r  = 16;
+    int32_t  r  = 16;
 
-    for (int step = 0; step < 80; ++step) {
+    // 8 precomputed offsets around a circle-ish shape
+    static const int8_t off_x[8] = {  0,  6, 10,  6,  0, -6,-10, -6 };
+    static const int8_t off_y[8] = { -10,-6,  0,  6, 10,  6,  0, -6 };
+
+    for (int step = 0; step < 64; ++step) {
         // clear ring area
         for (int32_t dy = -r-2; dy <= r+2; ++dy) {
             for (int32_t dx = -r-2; dx <= r+2; ++dx) {
-                uint32_t px = (uint32_t)((int32_t)cx + dx);
-                uint32_t py = (uint32_t)((int32_t)cy + dy);
-                if (px < g_width && py < g_height) {
-                    g_fb[(uint64_t)py * g_pitch + px] = 0x001020u;
+                int32_t px = (int32_t)cx + dx;
+                int32_t py = (int32_t)cy + dy;
+                if (px >= 0 && py >= 0 &&
+                    (uint32_t)px < g_width &&
+                    (uint32_t)py < g_height) {
+                    g_fb[(uint64_t)py * g_pitch + (uint32_t)px] = 0x001020u;
                 }
             }
         }
@@ -320,26 +317,31 @@ static void run_boot_splash(void) {
         for (int32_t dy = -r; dy <= r; ++dy) {
             for (int32_t dx = -r; dx <= r; ++dx) {
                 int32_t d2 = dx*dx + dy*dy;
-                if (d2 >= (r-1)*(r-1) && d2 <= (r+1)*(r+1)) {
-                    uint32_t px = (uint32_t)((int32_t)cx + dx);
-                    uint32_t py = (uint32_t)((int32_t)cy + dy);
-                    if (px < g_width && py < g_height) {
-                        g_fb[(uint64_t)py * g_pitch + px] = 0x5555FFu;
+                int32_t r1 = (r-1)*(r-1);
+                int32_t r2 = (r+1)*(r+1);
+                if (d2 >= r1 && d2 <= r2) {
+                    int32_t px = (int32_t)cx + dx;
+                    int32_t py = (int32_t)cy + dy;
+                    if (px >= 0 && py >= 0 &&
+                        (uint32_t)px < g_width &&
+                        (uint32_t)py < g_height) {
+                        g_fb[(uint64_t)py * g_pitch + (uint32_t)px] = 0x5555FFu;
                     }
                 }
             }
         }
-        // draw one "chunk" lit
-        int angle = (step * 18) % 360;
-        double rad = angle * 3.14159265 / 180.0;
-        int32_t hx = (int32_t)(cx + (r-1) * (float) __builtin_cos(rad));
-        int32_t hy = (int32_t)(cy + (r-1) * (float) __builtin_sin(rad));
+        // draw one "chunk" lit using lookup offsets
+        int idx = step & 7; // step % 8
+        int32_t hx = (int32_t)cx + off_x[idx];
+        int32_t hy = (int32_t)cy + off_y[idx];
         for (int32_t dy = -1; dy <= 1; ++dy) {
             for (int32_t dx = -1; dx <= 1; ++dx) {
-                uint32_t px = (uint32_t)(hx + dx);
-                uint32_t py = (uint32_t)(hy + dy);
-                if (px < g_width && py < g_height) {
-                    g_fb[(uint64_t)py * g_pitch + px] = 0xFFFFFFu;
+                int32_t px = hx + dx;
+                int32_t py = hy + dy;
+                if (px >= 0 && py >= 0 &&
+                    (uint32_t)px < g_width &&
+                    (uint32_t)py < g_height) {
+                    g_fb[(uint64_t)py * g_pitch + (uint32_t)px] = 0xFFFFFFu;
                 }
             }
         }
@@ -493,7 +495,7 @@ static void vfs_delete_node(int idx) {
 static void vfs_init(void) {
     g_vfs_count = 0;
     int root = vfs_add_node(VFS_DIR, -1, "");
-    if (root != 0) { /* shouldn't happen */ }
+    (void)root; // should be 0
 
     int docs = vfs_add_node(VFS_DIR, 0, "docs");
     int etc  = vfs_add_node(VFS_DIR, 0, "etc");
@@ -543,18 +545,6 @@ static void vfs_build_path(char *buf, uint32_t max_len, int node_index) {
     str_copy(buf, tmp, max_len);
 }
 
-static void vfs_list_dir(TerminalState *t, int dir_index) {
-    char line[TERM_MAX_COLS];
-    char path[64];
-    vfs_build_path(path, sizeof(path), dir_index);
-    str_copy(line, "Directory of ", TERM_MAX_COLS);
-    str_cat(line, path, TERM_MAX_COLS);
-    term_add_line:
-    { } // placeholder so label compiles if you paste this under GCC without -Werror
-}
-
-// We will not use term_add_line label approach; we define term_add_line next.
-
 // ---------------------------------------------------------------------
 // Terminal helpers
 // ---------------------------------------------------------------------
@@ -585,10 +575,6 @@ static void vfs_list_dir_to_terminal(TerminalState *t, int dir_index) {
     }
 }
 
-// ---------------------------------------------------------------------
-// Terminal implementation
-// ---------------------------------------------------------------------
-
 static void term_reset(TerminalState *t) {
     if (!t) return;
     t->line_count = 0;
@@ -613,7 +599,7 @@ static void term_add_line(TerminalState *t, const char *text) {
     t->line_count++;
 }
 
-// Find node by path relative to g_cwd
+// Find node by path relative to g_cwd (simple, one-component names)
 static int vfs_resolve_simple(const char *name, int expect_dir, int *out_parent) {
     if (!name || !*name) {
         if (out_parent) *out_parent = g_cwd;
@@ -1101,8 +1087,6 @@ static void draw_taskbar(void) {
     draw_rect_border(sx, sy, sw, sh, 0x505860u);
     draw_text(sx + 8, sy + (sh / 2) - 6, "Start", 0xFFFFFFu, 1);
 
-    // center "shelf" hint line (for icons)
-    // icons themselves are separate (see draw_dock)
     // Right side: time/date + battery + wifi
     char tbuf[16], dbuf[16];
     format_time(tbuf, sizeof(tbuf));
@@ -1269,16 +1253,36 @@ static void draw_settings_contents(uint32_t win_x, uint32_t win_y,
     buf[0] = '\0';
     str_copy(buf, "Resolution: ", sizeof(buf));
     char tmp[16];
-    tmp[0] = '0' + (g_width / 1000) % 10; // crude; fine for typical resolutions
-    tmp[1] = '0' + (g_width / 100)  % 10;
-    tmp[2] = '0' + (g_width / 10)   % 10;
-    tmp[3] = '0' + (g_width        ) % 10;
-    tmp[4] = 'x';
-    tmp[5] = '0' + (g_height / 1000) % 10;
-    tmp[6] = '0' + (g_height / 100)  % 10;
-    tmp[7] = '0' + (g_height / 10)   % 10;
-    tmp[8] = '0' + (g_height        ) % 10;
-    tmp[9] = '\0';
+
+    // very simple decimal formatting
+    uint32_t w = g_width;
+    uint32_t h = g_height;
+    // width
+    int pos = 0;
+    uint32_t div = 1000;
+    int started = 0;
+    while (div > 0 && pos < 4) {
+        char digit = (char)('0' + (w / div) % 10);
+        if (digit != '0' || started || div == 1) {
+            tmp[pos++] = digit;
+            started = 1;
+        }
+        div /= 10;
+    }
+    tmp[pos++] = 'x';
+    // height
+    div = 1000;
+    started = 0;
+    while (div > 0 && pos < 9) {
+        char digit = (char)('0' + (h / div) % 10);
+        if (digit != '0' || started || div == 1) {
+            tmp[pos++] = digit;
+            started = 1;
+        }
+        div /= 10;
+    }
+    tmp[pos] = '\0';
+
     str_cat(buf, tmp, sizeof(buf));
     draw_text(x + 4, y, buf, 0x000000u, 1);
     y += 14;
@@ -1530,7 +1534,7 @@ static void draw_desktop(int selected_icon, int open_app) {
 static void handle_nav_scancode(uint8_t sc,
                                 int *selected_icon,
                                 int *open_app) {
-    if (sc & 0x80) return; // ignore releases (Shift handled earlier in terminal)
+    if (sc & 0x80) return; // ignore releases (Shift handled separately in terminal)
 
     // Up / Down arrows change selection
     if (sc == 0x48) {            // Up
@@ -1568,8 +1572,7 @@ static void handle_nav_scancode(uint8_t sc,
     if (sc == 0x11) dx = -8;        // W -> left
     if (sc == 0x12) dy = -8;        // E -> up
     if (sc == 0x1E) dx = 8;         // A -> right
-    if (sc == 0x1F) dy = 8;         // S -> down (already used for start toggle)
-    // We'll just ignore conflict; primarily this is a debug mouse anyway.
+    if (sc == 0x20) dy = 8;         // D -> down
     g_mouse.x += dx;
     g_mouse.y += dy;
     if (g_mouse.x < 0) g_mouse.x = 0;
