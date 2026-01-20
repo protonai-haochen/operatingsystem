@@ -1,457 +1,351 @@
-// LightOS 4 kernel - revised full version
-// Framebuffer desktop + Command Block shell.
-// No mouse, no real filesystem yet.
+// kernel/core/kernel.c
+// LightOS 4 - simple UEFI framebuffer "kernel" with desktop + Command Block
 
 #include <stdint.h>
 #include "boot.h"
 
 // ---------------------------------------------------------------------
-// Global framebuffer state
+// Global framebuffer info
 // ---------------------------------------------------------------------
 
-static uint32_t *g_fb    = 0;
-static uint32_t  g_width = 0;
-static uint32_t  g_height = 0;
-static uint32_t  g_pitch  = 0;   // pixels per scanline
+static uint32_t *g_fb      = 0;
+static uint32_t  g_width   = 0;
+static uint32_t  g_height  = 0;
+static uint32_t  g_pitch   = 0;   // pixels per row
 
 // ---------------------------------------------------------------------
-// CPU / I/O helpers
-// ---------------------------------------------------------------------
-
-static inline uint8_t inb(uint16_t port) {
-    uint8_t value;
-    __asm__ volatile("inb %1, %0" : "=a"(value) : "Nd"(port));
-    return value;
-}
-
-// Non-blocking PS/2 keyboard poll.
-// Returns 1 if a scancode was read into *sc, 0 if none.
-static int keyboard_poll(uint8_t *sc) {
-    uint8_t status = inb(0x64);
-    if ((status & 0x01) == 0)
-        return 0;
-    *sc = inb(0x60);
-    return 1;
-}
-
-// ---------------------------------------------------------------------
-// Drawing primitives
+// Basic drawing primitives
 // ---------------------------------------------------------------------
 
 static inline void put_pixel(uint32_t x, uint32_t y, uint32_t color) {
     if (x >= g_width || y >= g_height) return;
-    g_fb[(uint64_t)y * g_pitch + x] = color;
+    g_fb[y * g_pitch + x] = color;
 }
 
 static void fill_rect(uint32_t x, uint32_t y,
                       uint32_t w, uint32_t h,
                       uint32_t color) {
     if (x >= g_width || y >= g_height) return;
+    if (x + w > g_width)  w = g_width  - x;
+    if (y + h > g_height) h = g_height - y;
 
-    uint32_t max_x = x + w;
-    uint32_t max_y = y + h;
-    if (max_x > g_width)  max_x = g_width;
-    if (max_y > g_height) max_y = g_height;
-
-    for (uint32_t yy = y; yy < max_y; ++yy) {
-        uint32_t *row = g_fb + (uint64_t)yy * g_pitch;
-        for (uint32_t xx = x; xx < max_x; ++xx) {
-            row[xx] = color;
+    for (uint32_t yy = 0; yy < h; ++yy) {
+        uint32_t row = (y + yy) * g_pitch;
+        for (uint32_t xx = 0; xx < w; ++xx) {
+            g_fb[row + x + xx] = color;
         }
     }
 }
 
-static void fill_circle(uint32_t cx, uint32_t cy, uint32_t r, uint32_t color) {
-    for (int32_t y = -(int32_t)r; y <= (int32_t)r; ++y) {
-        for (int32_t x = -(int32_t)r; x <= (int32_t)r; ++x) {
-            if (x * x + y * y <= (int32_t)r * (int32_t)r) {
-                uint32_t px = (uint32_t)((int32_t)cx + x);
-                uint32_t py = (uint32_t)((int32_t)cy + y);
-                put_pixel(px, py, color);
-            }
+static void draw_rect(uint32_t x, uint32_t y,
+                      uint32_t w, uint32_t h,
+                      uint32_t color) {
+    if (w == 0 || h == 0) return;
+    if (x >= g_width || y >= g_height) return;
+
+    uint32_t x2 = x + w - 1;
+    uint32_t y2 = y + h - 1;
+
+    if (x2 >= g_width)  x2 = g_width  - 1;
+    if (y2 >= g_height) y2 = g_height - 1;
+
+    for (uint32_t xx = x; xx <= x2; ++xx) {
+        put_pixel(xx, y,  color);
+        put_pixel(xx, y2, color);
+    }
+
+    for (uint32_t yy = y; yy <= y2; ++yy) {
+        put_pixel(x,  yy, color);
+        put_pixel(x2, yy, color);
+    }
+}
+
+static void fill_circle(int32_t cx, int32_t cy,
+                        int32_t r, uint32_t color) {
+    if (r <= 0) return;
+    int32_t r2 = r * r;
+
+    for (int32_t dy = -r; dy <= r; ++dy) {
+        int32_t yy = cy + dy;
+        if (yy < 0 || yy >= (int32_t)g_height) continue;
+
+        int32_t dx_limit_sq = r2 - dy * dy;
+        if (dx_limit_sq < 0) continue;
+
+        // simple integer sqrt using float, we don't need precision
+        int32_t dx_limit = (int32_t)(dx_limit_sq > 0
+            ? __builtin_sqrt((double)dx_limit_sq)
+            : 0);
+
+        int32_t start_x = cx - dx_limit;
+        int32_t end_x   = cx + dx_limit;
+
+        if (start_x < 0) start_x = 0;
+        if (end_x >= (int32_t)g_width) end_x = (int32_t)g_width - 1;
+
+        uint32_t row = yy * g_pitch;
+        for (int32_t xx = start_x; xx <= end_x; ++xx) {
+            g_fb[row + xx] = color;
         }
     }
 }
 
 // ---------------------------------------------------------------------
-// Tiny 8x8 bitmap font for a subset of ASCII (enough for our UI)
+// Tiny 8x8 bitmap font for ASCII subset
 // ---------------------------------------------------------------------
 
 typedef struct {
-    char c;
+    char    c;
     uint8_t rows[8];
 } Glyph8;
 
 static const Glyph8 FONT8[] = {
-    // Basic letters used in UI text
-    { 'A', { 0b00011000,
-             0b00100100,
-             0b01000010,
-             0b01111110,
-             0b01000010,
-             0b01000010,
-             0b00000000,
-             0 } },
-    { 'B', { 0b01111100,
-             0b01000010,
-             0b01111100,
-             0b01000010,
-             0b01000010,
-             0b01111100,
-             0,
-             0 } },
-    { 'C', { 0b00111100,
-             0b01000010,
-             0b01000000,
-             0b01000000,
-             0b01000010,
-             0b00111100,
-             0,
-             0 } },
-    { 'D', { 0b01111000,
-             0b01000100,
-             0b01000010,
-             0b01000010,
-             0b01000100,
-             0b01111000,
-             0,
-             0 } },
-    { 'E', { 0b01111110,
-             0b01000000,
-             0b01111100,
-             0b01000000,
-             0b01000000,
-             0b01111110,
-             0,
-             0 } },
-    { 'G', { 0b00111100,
-             0b01000010,
-             0b01000000,
-             0b01001110,
-             0b01000010,
-             0b00111100,
-             0,
-             0 } },
-    { 'H', { 0b01000010,
-             0b01000010,
-             0b01111110,
-             0b01000010,
-             0b01000010,
-             0b01000010,
-             0,
-             0 } },
-    { 'I', { 0b00111100,
-             0b00011000,
-             0b00011000,
-             0b00011000,
-             0b00011000,
-             0b00111100,
-             0,
-             0 } },
-    { 'L', { 0b01000000,
-             0b01000000,
-             0b01000000,
-             0b01000000,
-             0b01000000,
-             0b01111110,
-             0,
-             0 } },
-    { 'M', { 0b01000010,
-             0b01100110,
-             0b01011010,
-             0b01000010,
-             0b01000010,
-             0b01000010,
-             0,
-             0 } },
-    { 'N', { 0b01000010,
-             0b01100010,
-             0b01010010,
-             0b01001010,
-             0b01000110,
-             0b01000010,
-             0,
-             0 } },
-    { 'O', { 0b00111100,
-             0b01000010,
-             0b01000010,
-             0b01000010,
-             0b01000010,
-             0b00111100,
-             0,
-             0 } },
-    { 'R', { 0b01111100,
-             0b01000010,
-             0b01111100,
-             0b01001000,
-             0b01000100,
-             0b01000010,
-             0,
-             0 } },
-    { 'S', { 0b00111100,
-             0b01000000,
-             0b00111100,
-             0b00000010,
-             0b00000010,
-             0b00111100,
-             0,
-             0 } },
-    { 'T', { 0b01111110,
-             0b00011000,
-             0b00011000,
-             0b00011000,
-             0b00011000,
-             0b00011000,
-             0,
-             0 } },
-    { 'U', { 0b01000010,
-             0b01000010,
-             0b01000010,
-             0b01000010,
-             0b01000010,
-             0b00111100,
-             0,
-             0 } },
-    { 'V', { 0b01000010,
-             0b01000010,
-             0b01000010,
-             0b00100100,
-             0b00100100,
-             0b00011000,
-             0,
-             0 } },
-    { 'Y', { 0b01000010,
-             0b00100100,
-             0b00011000,
-             0b00011000,
-             0b00011000,
-             0b00011000,
-             0,
-             0 } },
-    { '0', { 0b00111100,
-             0b01000010,
-             0b01000010,
-             0b01000010,
-             0b01000010,
-             0b00111100,
-             0,
-             0 } },
-    { '1', { 0b00011000,
-             0b00101000,
-             0b00001000,
-             0b00001000,
-             0b00001000,
-             0b00111100,
-             0,
-             0 } },
-    { '2', { 0b00111100,
-             0b01000010,
-             0b00000100,
-             0b00011000,
-             0b00100000,
-             0b01111110,
-             0,
-             0 } },
-    { '3', { 0b00111100,
-             0b01000010,
-             0b00000100,
-             0b00011100,
-             0b01000010,
-             0b00111100,
-             0,
-             0 } },
-    { '4', { 0b00001100,
-             0b00010100,
-             0b00100100,
-             0b01000100,
-             0b01111110,
-             0b00000100,
-             0,
-             0 } },
-    { '5', { 0b01111110,
-             0b01000000,
-             0b01111100,
-             0b00000010,
-             0b00000010,
-             0b01111100,
-             0,
-             0 } },
-    { '6', { 0b00111100,
-             0b01000000,
-             0b01111100,
-             0b01000010,
-             0b01000010,
-             0b00111100,
-             0,
-             0 } },
-    { '7', { 0b01111110,
-             0b00000010,
-             0b00000100,
-             0b00001000,
-             0b00010000,
-             0b00010000,
-             0,
-             0 } },
-    { '8', { 0b00111100,
-             0b01000010,
-             0b00111100,
-             0b01000010,
-             0b01000010,
-             0b00111100,
-             0,
-             0 } },
-    { '9', { 0b00111100,
-             0b01000010,
-             0b01000010,
-             0b00111110,
-             0b00000010,
-             0b00111100,
-             0,
-             0 } },
-    { ':', { 0b00000000,
-             0b00011000,
-             0b00011000,
-             0b00000000,
-             0b00011000,
-             0b00011000,
-             0,
-             0 } },
-    { '-', { 0b00000000,
-             0b00000000,
-             0b00000000,
-             0b01111110,
-             0b00000000,
-             0b00000000,
-             0,
-             0 } },
-    { ' ', { 0,0,0,0,0,0,0,0 } },
+    { ' ', { 0b00000000, 0b00000000, 0b00000000, 0b00000000,
+             0b00000000, 0b00000000, 0b00000000, 0b00000000 } },
+    { '\'', { 0b00010000, 0b00010000, 0b00100000, 0b00000000,
+              0b00000000, 0b00000000, 0b00000000, 0b00000000 } },
+    { '-', { 0b00000000, 0b00000000, 0b00000000, 0b01111110,
+             0b00000000, 0b00000000, 0b00000000, 0b00000000 } },
+    { '.', { 0b00000000, 0b00000000, 0b00000000, 0b00000000,
+             0b00011000, 0b00011000, 0b00000000, 0b00000000 } },
+    { '/', { 0b00000010, 0b00000100, 0b00000100, 0b00001000,
+             0b00001000, 0b00010000, 0b00010000, 0b00000000 } },
+    { '0', { 0b00011100, 0b00100010, 0b00100110, 0b00101010,
+             0b00110010, 0b00100010, 0b00011100, 0b00000000 } },
+    { '1', { 0b00001000, 0b00011000, 0b00001000, 0b00001000,
+             0b00001000, 0b00001000, 0b00011100, 0b00000000 } },
+    { '2', { 0b00011100, 0b00100010, 0b00000010, 0b00001100,
+             0b00010000, 0b00100000, 0b00111110, 0b00000000 } },
+    { '3', { 0b00111100, 0b00000010, 0b00000010, 0b00011100,
+             0b00000010, 0b00000010, 0b00111100, 0b00000000 } },
+    { '4', { 0b00010010, 0b00010010, 0b00010010, 0b00111110,
+             0b00000010, 0b00000010, 0b00000010, 0b00000000 } },
+    { '5', { 0b00111110, 0b00100000, 0b00111100, 0b00000010,
+             0b00000010, 0b00100010, 0b00011100, 0b00000000 } },
+    { '6', { 0b00011100, 0b00100000, 0b00100000, 0b00111100,
+             0b00100010, 0b00100010, 0b00011100, 0b00000000 } },
+    { '7', { 0b00111110, 0b00000010, 0b00000100, 0b00001000,
+             0b00010000, 0b00010000, 0b00010000, 0b00000000 } },
+    { '8', { 0b00011100, 0b00100010, 0b00100010, 0b00011100,
+             0b00100010, 0b00100010, 0b00011100, 0b00000000 } },
+    { '9', { 0b00011100, 0b00100010, 0b00100010, 0b00011110,
+             0b00000010, 0b00000010, 0b00011100, 0b00000000 } },
+    { ':', { 0b00000000, 0b00001000, 0b00001000, 0b00000000,
+             0b00001000, 0b00001000, 0b00000000, 0b00000000 } },
+    { '?', { 0b00011100, 0b00100010, 0b00000100, 0b00001000,
+             0b00001000, 0b00000000, 0b00001000, 0b00000000 } },
+    { 'A', { 0b00011000, 0b00100100, 0b00100100, 0b00111100,
+             0b00100100, 0b00100100, 0b00000000, 0b00000000 } },
+    { 'B', { 0b00111000, 0b00100100, 0b00111000, 0b00100100,
+             0b00100100, 0b00111000, 0b00000000, 0b00000000 } },
+    { 'C', { 0b00011100, 0b00100010, 0b00100000, 0b00100000,
+             0b00100010, 0b00011100, 0b00000000, 0b00000000 } },
+    { 'D', { 0b00111000, 0b00100100, 0b00100010, 0b00100010,
+             0b00100100, 0b00111000, 0b00000000, 0b00000000 } },
+    { 'E', { 0b00111110, 0b00100000, 0b00111000, 0b00100000,
+             0b00100000, 0b00111110, 0b00000000, 0b00000000 } },
+    { 'F', { 0b00111110, 0b00100000, 0b00111000, 0b00100000,
+             0b00100000, 0b00100000, 0b00000000, 0b00000000 } },
+    { 'G', { 0b00011100, 0b00100010, 0b00100000, 0b00111110,
+             0b00100010, 0b00011100, 0b00000000, 0b00000000 } },
+    { 'H', { 0b00100010, 0b00100010, 0b00111110, 0b00100010,
+             0b00100010, 0b00100010, 0b00000000, 0b00000000 } },
+    { 'I', { 0b00011100, 0b00001000, 0b00001000, 0b00001000,
+             0b00001000, 0b00011100, 0b00000000, 0b00000000 } },
+    { 'J', { 0b00001110, 0b00000010, 0b00000010, 0b00000010,
+             0b00100010, 0b00011100, 0b00000000, 0b00000000 } },
+    { 'K', { 0b00100010, 0b00100100, 0b00111000, 0b00100100,
+             0b00100010, 0b00100010, 0b00000000, 0b00000000 } },
+    { 'L', { 0b00100000, 0b00100000, 0b00100000, 0b00100000,
+             0b00100000, 0b00111110, 0b00000000, 0b00000000 } },
+    { 'M', { 0b00100010, 0b00110110, 0b00101010, 0b00100010,
+             0b00100010, 0b00100010, 0b00000000, 0b00000000 } },
+    { 'N', { 0b00100010, 0b00110010, 0b00101010, 0b00100110,
+             0b00100010, 0b00100010, 0b00000000, 0b00000000 } },
+    { 'O', { 0b00011100, 0b00100010, 0b00100010, 0b00100010,
+             0b00100010, 0b00011100, 0b00000000, 0b00000000 } },
+    { 'P', { 0b00111000, 0b00100100, 0b00100100, 0b00111000,
+             0b00100000, 0b00100000, 0b00000000, 0b00000000 } },
+    { 'Q', { 0b00011100, 0b00100010, 0b00100010, 0b00100010,
+             0b00100110, 0b00011110, 0b00000000, 0b00000000 } },
+    { 'R', { 0b00111000, 0b00100100, 0b00100100, 0b00111000,
+             0b00101000, 0b00100100, 0b00000000, 0b00000000 } },
+    { 'S', { 0b00011100, 0b00100000, 0b00011000, 0b00000100,
+             0b00000100, 0b00111000, 0b00000000, 0b00000000 } },
+    { 'T', { 0b00111110, 0b00001000, 0b00001000, 0b00001000,
+             0b00001000, 0b00001000, 0b00000000, 0b00000000 } },
+    { 'U', { 0b00100010, 0b00100010, 0b00100010, 0b00100010,
+             0b00100010, 0b00011100, 0b00000000, 0b00000000 } },
+    { 'V', { 0b00100010, 0b00100010, 0b00100010, 0b00100010,
+             0b00010100, 0b00001000, 0b00000000, 0b00000000 } },
+    { 'W', { 0b00100010, 0b00100010, 0b00100010, 0b00101010,
+             0b00110110, 0b00100010, 0b00000000, 0b00000000 } },
+    { 'X', { 0b00100010, 0b00010100, 0b00001000, 0b00001000,
+             0b00010100, 0b00100010, 0b00000000, 0b00000000 } },
+    { 'Y', { 0b00100010, 0b00010100, 0b00001000, 0b00001000,
+             0b00001000, 0b00001000, 0b00000000, 0b00000000 } },
+    { 'Z', { 0b00111110, 0b00000010, 0b00000100, 0b00001000,
+             0b00010000, 0b00111110, 0b00000000, 0b00000000 } },
 };
 
-static const uint8_t *font_lookup(char c) {
-    for (unsigned i = 0; i < sizeof(FONT8)/sizeof(FONT8[0]); ++i) {
+static const uint8_t* font_lookup(char c) {
+    // normalize to uppercase so lowercase still shows
+    if (c >= 'a' && c <= 'z') {
+        c = (char)(c - 'a' + 'A');
+    }
+
+    for (uint32_t i = 0; i < (uint32_t)(sizeof(FONT8) / sizeof(FONT8[0])); ++i) {
         if (FONT8[i].c == c) return FONT8[i].rows;
     }
-    // default to space
-    return FONT8[sizeof(FONT8)/sizeof(FONT8[0]) - 1].rows;
+
+    // fallback: '?' if present, else space
+    for (uint32_t i = 0; i < (uint32_t)(sizeof(FONT8) / sizeof(FONT8[0])); ++i) {
+        if (FONT8[i].c == '?') return FONT8[i].rows;
+    }
+    return FONT8[0].rows; // assume first is space
 }
 
 static void draw_char(uint32_t x, uint32_t y,
-                      char c, uint32_t color, uint32_t scale) {
+                      char c, uint32_t color,
+                      uint32_t scale) {
     const uint8_t *rows = font_lookup(c);
+
     for (uint32_t row = 0; row < 8; ++row) {
         uint8_t bits = rows[row];
         for (uint32_t col = 0; col < 8; ++col) {
-            if (bits & (0x80u >> col)) {
-                for (uint32_t dy = 0; dy < scale; ++dy) {
-                    for (uint32_t dx = 0; dx < scale; ++dx) {
-                        put_pixel(x + col * scale + dx,
-                                  y + row * scale + dy,
-                                  color);
-                    }
-                }
+            if (bits & (1u << (7 - col))) {
+                uint32_t px = x + col * scale;
+                uint32_t py = y + row * scale;
+                fill_rect(px, py, scale, scale, color);
             }
         }
     }
 }
 
 static void draw_text(uint32_t x, uint32_t y,
-                      const char *s, uint32_t color, uint32_t scale) {
+                      const char *s, uint32_t color,
+                      uint32_t scale) {
+    if (!s) return;
+    uint32_t cursor_x = x;
     while (*s) {
         if (*s == '\n') {
+            cursor_x = x;
             y += 8 * scale + 2;
-            x = 0;
-            s++;
-            continue;
+        } else {
+            draw_char(cursor_x, y, *s, color, scale);
+            cursor_x += 8 * scale;
         }
-        draw_char(x, y, *s, color, scale);
-        x += 8 * scale;
-        s++;
+        ++s;
     }
 }
 
 // ---------------------------------------------------------------------
-// Boot splash: bulb + "LightOS 4" + spinner UNDER the text
+// Light bulb + spinner for boot splash
 // ---------------------------------------------------------------------
 
 static void draw_bulb(uint32_t cx, uint32_t cy, uint32_t r,
-                      uint32_t body, uint32_t outline, uint32_t base) {
-    if (r < 32) r = 32;
+                      uint32_t body_color,
+                      uint32_t outline_color,
+                      uint32_t base_color) {
+    if (r < 16) r = 16;
 
-    // Circle
-    fill_circle(cx, cy, r, outline);
-    fill_circle(cx, cy, r - 3, body);
+    // main bulb
+    fill_circle((int32_t)cx, (int32_t)cy, (int32_t)r, body_color);
 
-    // Short base so text has room below
-    uint32_t base_w = (r * 4) / 3;
-    if (base_w < 32) base_w = 32;
-    uint32_t base_h = r / 3;
-    if (base_h < 12) base_h = 12;
+    // outline
+    uint32_t outline_r = r + 2;
+    for (int32_t dy = -(int32_t)outline_r; dy <= (int32_t)outline_r; ++dy) {
+        for (int32_t dx = -(int32_t)outline_r; dx <= (int32_t)outline_r; ++dx) {
+            int32_t xx = (int32_t)cx + dx;
+            int32_t yy = (int32_t)cy + dy;
+            if (xx < 0 || yy < 0 ||
+                xx >= (int32_t)g_width ||
+                yy >= (int32_t)g_height) continue;
 
-    uint32_t base_x = cx - base_w / 2;
-    uint32_t base_y = cy + r + 8;
-    fill_rect(base_x, base_y, base_w, base_h, base);
+            int32_t d2 = dx*dx + dy*dy;
+            if (d2 <= (int32_t)outline_r*(int32_t)outline_r &&
+                d2 >= (int32_t)r*(int32_t)r) {
+                g_fb[yy * g_pitch + xx] = outline_color;
+            }
+        }
+    }
+
+    // metal base
+    uint32_t base_w  = r;
+    uint32_t base_h  = r / 3;
+    if (base_h < 8) base_h = 8;
+    uint32_t base_x  = cx - base_w / 2;
+    uint32_t base_y  = cy + r - base_h / 2;
+
+    fill_rect(base_x, base_y, base_w, base_h, base_color);
+
+    // ridges
+    uint32_t ridge_h = base_h / 4;
+    if (ridge_h == 0) ridge_h = 1;
+    uint32_t ridge_y1 = base_y;
+    uint32_t ridge_y2 = base_y + ridge_h * 2;
+    uint32_t ridge_col = (base_color & 0xFEFEFE) >> 1;
+
+    fill_rect(base_x, ridge_y1, base_w, ridge_h, ridge_col);
+    fill_rect(base_x, ridge_y2, base_w, ridge_h, ridge_col);
 }
 
 static void draw_spinner_frame(uint32_t cx, uint32_t cy,
-                               uint32_t radius, uint32_t frame,
-                               uint32_t bg) {
-    const int8_t dx[8] = { 0,  1,  1,  1,  0, -1, -1, -1 };
-    const int8_t dy[8] = { -1, -1,  0,  1,  1,  1,  0, -1 };
+                               uint32_t radius,
+                               uint32_t frame,
+                               uint32_t bg_color) {
+    const uint32_t segments = 12;
+    uint32_t active  = frame % segments;
 
-    uint32_t dot = radius / 3;
-    if (dot < 3) dot = 3;
+    for (uint32_t i = 0; i < segments; ++i) {
+        double angle = 2.0 * 3.1415926535 * (double)i / (double)segments;
+        uint32_t x = cx + (uint32_t)(radius * 0.8 * __builtin_cos(angle));
+        uint32_t y = cy + (uint32_t)(radius * 0.8 * __builtin_sin(angle));
 
-    // Clear area around spinner
-    uint32_t box = radius * 2 + dot * 2;
-    fill_rect(cx - box / 2, cy - box / 2, box, box, bg);
+        uint32_t color = (i == active)
+            ? 0xFFFFFF
+            : ((bg_color & 0xFCFCFC) >> 2);
 
-    for (uint32_t i = 0; i < 8; ++i) {
-        int32_t px = (int32_t)cx + dx[i] * (int32_t)radius;
-        int32_t py = (int32_t)cy + dy[i] * (int32_t)radius;
-        uint32_t col = (i == (frame & 7)) ? 0xFFFFFFu : 0x505060u;
-        fill_rect((uint32_t)(px - (int32_t)(dot / 2)),
-                  (uint32_t)(py - (int32_t)(dot / 2)),
-                  dot, dot, col);
+        fill_circle((int32_t)x, (int32_t)y, (int32_t)(radius / 8 + 1), color);
     }
 }
 
 static void run_boot_splash(void) {
-    const uint32_t bg           = 0x101020u;
-    const uint32_t bulb_body    = 0xFFF7CCu;
-    const uint32_t bulb_outline = 0xD0C080u;
-    const uint32_t bulb_base    = 0x303040u;
+    const uint32_t bg           = 0x101020;
+    const uint32_t bulb_body    = 0xFFF7CC;
+    const uint32_t bulb_outline = 0xD0C080;
+    const uint32_t bulb_base    = 0x303040;
 
+    // clear whole screen
     fill_rect(0, 0, g_width, g_height, bg);
 
     uint32_t cx = g_width  / 2;
     uint32_t cy = g_height / 3;
-    uint32_t r  = g_height / 12;
-    if (r < 40) r = 40;
-
-    draw_bulb(cx, cy, r, bulb_body, bulb_outline, bulb_base);
+    uint32_t r  = g_height / 10;
+    if (r < 50) r = 50;
 
     uint32_t text_scale = 3;
     uint32_t text_h     = 8 * text_scale;
 
     uint32_t base_h      = r / 3;
-    if (base_h < 12) base_h = 12;
-    uint32_t base_bottom = cy + r + 8 + base_h;
+    if (base_h < 16) base_h = 16;
 
-    uint32_t title_y = base_bottom + 16;       // BELOW bulb
-    const char *title = "LIGHTOS 4";
-    uint32_t text_w  = 9 * 8 * text_scale;     // approximate width
-    uint32_t title_x = (cx > text_w / 2) ? cx - text_w / 2 : 0;
+    uint32_t base_bottom = cy + r + 16 + base_h;
+    uint32_t title_y     = base_bottom + 30;
+    uint32_t text_w      = 9 * 8 * text_scale;  // "LightOS 4"
+    uint32_t title_x     = (cx > text_w / 2) ? (cx - text_w / 2) : 0;
 
-    uint32_t spinner_r = r / 2;
-    uint32_t spinner_y = title_y + text_h + 24; // clearly under text
+    uint32_t spinner_r   = r / 2;
+    if (spinner_r < 20) spinner_r = 20;
+    uint32_t spinner_y   = title_y + text_h + 40;
 
     for (uint32_t frame = 0; frame < 48; ++frame) {
         fill_rect(0, 0, g_width, g_height, bg);
         draw_bulb(cx, cy, r, bulb_body, bulb_outline, bulb_base);
-        draw_text(title_x, title_y, title, 0xFFFFFFu, text_scale);
+        draw_text(title_x, title_y, "LightOS 4", 0xFFFFFF, text_scale);
         draw_spinner_frame(cx, spinner_y, spinner_r, frame, bg);
 
-        // crude delay loop for animation
+        // crude delay for animation
         for (volatile uint64_t wait = 0; wait < 12000000ULL; ++wait) {
             __asm__ volatile("");
         }
@@ -459,7 +353,25 @@ static void run_boot_splash(void) {
 }
 
 // ---------------------------------------------------------------------
-// Command Block terminal state
+// Simple keyboard (PS/2) polling
+// ---------------------------------------------------------------------
+
+static inline uint8_t inb(uint16_t port) {
+    uint8_t ret;
+    __asm__ volatile ("inb %1, %0" : "=a"(ret) : "Nd"(port));
+    return ret;
+}
+
+static int keyboard_poll(uint8_t *out_scancode) {
+    if ((inb(0x64) & 0x01) == 0) {
+        return 0;
+    }
+    *out_scancode = inb(0x60);
+    return 1;
+}
+
+// ---------------------------------------------------------------------
+// Command Block (terminal) implementation
 // ---------------------------------------------------------------------
 
 #define TERM_MAX_LINES 32
@@ -476,176 +388,92 @@ static TerminalState g_term;
 
 static uint32_t str_len(const char *s) {
     uint32_t n = 0;
-    if (!s) return 0;
-    while (s[n]) ++n;
+    while (s && s[n]) ++n;
     return n;
 }
 
-static int str_eq(const char *a, const char *b) {
+static void str_copy(char *dst, const char *src, uint32_t max_len) {
+    if (!dst || !src || max_len == 0) return;
     uint32_t i = 0;
-    while (a[i] && b[i]) {
-        if (a[i] != b[i]) return 0;
-        ++i;
+    for (; i + 1 < max_len && src[i]; ++i) {
+        dst[i] = src[i];
     }
-    return a[i] == 0 && b[i] == 0;
+    dst[i] = '\0';
 }
 
 static int str_starts_with(const char *s, const char *prefix) {
-    uint32_t i = 0;
-    while (prefix[i]) {
-        if (s[i] != prefix[i]) return 0;
-        ++i;
+    if (!s || !prefix) return 0;
+    while (*prefix) {
+        if (*s != *prefix) return 0;
+        ++s;
+        ++prefix;
     }
     return 1;
 }
 
-static void term_add_line(TerminalState *t, const char *s) {
+static void term_add_line(TerminalState *t, const char *line) {
     if (!t) return;
-
-    if (t->line_count == TERM_MAX_LINES) {
+    if (t->line_count >= TERM_MAX_LINES) {
         // scroll up
         for (uint32_t i = 1; i < TERM_MAX_LINES; ++i) {
-            for (uint32_t j = 0; j < TERM_MAX_COLS; ++j)
-                t->lines[i - 1][j] = t->lines[i][j];
+            str_copy(t->lines[i - 1], t->lines[i], TERM_MAX_COLS);
         }
         t->line_count = TERM_MAX_LINES - 1;
     }
-
-    uint32_t len = str_len(s);
-    if (len >= TERM_MAX_COLS) len = TERM_MAX_COLS - 1;
-
-    uint32_t idx = t->line_count++;
-    uint32_t j   = 0;
-    for (; j < len; ++j) t->lines[idx][j] = s[j];
-    t->lines[idx][j] = '\0';
+    str_copy(t->lines[t->line_count], line ? line : "", TERM_MAX_COLS);
+    t->line_count++;
 }
 
-static void term_clear(TerminalState *t) {
-    if (!t) return;
+static void term_reset(TerminalState *t) {
     t->line_count = 0;
     t->input_len  = 0;
     t->input[0]   = '\0';
+
+    term_add_line(t, "LightOS 4 Command Block");
+    term_add_line(t, "Type 'help' for commands.");
+    term_add_line(t, "");
 }
 
-static void term_init(TerminalState *t) {
-    term_clear(t);
-    term_add_line(t, "LIGHTOS 4 COMMAND BLOCK");
-    term_add_line(t, "TYPE 'HELP' FOR COMMANDS.");
-}
+static void term_execute_command(TerminalState *t, const char *cmd) {
+    if (!cmd || !*cmd) return;
 
-// Convert PS/2 scancode (set 1) to ASCII (no shift)
-static char scancode_to_char(uint8_t sc) {
-    switch (sc) {
-        // number row
-        case 0x02: return '1';
-        case 0x03: return '2';
-        case 0x04: return '3';
-        case 0x05: return '4';
-        case 0x06: return '5';
-        case 0x07: return '6';
-        case 0x08: return '7';
-        case 0x09: return '8';
-        case 0x0A: return '9';
-        case 0x0B: return '0';
-        case 0x0C: return '-';
-        case 0x0D: return '=';
-        // QWERTY rows
-        case 0x10: return 'q';
-        case 0x11: return 'w';
-        case 0x12: return 'e';
-        case 0x13: return 'r';
-        case 0x14: return 't';
-        case 0x15: return 'y';
-        case 0x16: return 'u';
-        case 0x17: return 'i';
-        case 0x18: return 'o';
-        case 0x19: return 'p';
-        case 0x1E: return 'a';
-        case 0x1F: return 's';
-        case 0x20: return 'd';
-        case 0x21: return 'f';
-        case 0x22: return 'g';
-        case 0x23: return 'h';
-        case 0x24: return 'j';
-        case 0x25: return 'k';
-        case 0x26: return 'l';
-        case 0x2C: return 'z';
-        case 0x2D: return 'x';
-        case 0x2E: return 'c';
-        case 0x2F: return 'v';
-        case 0x30: return 'b';
-        case 0x31: return 'n';
-        case 0x32: return 'm';
-        case 0x33: return ',';
-        case 0x34: return '.';
-        case 0x35: return '/';
-        case 0x39: return ' ';
-        default:   return 0;
-    }
-}
-
-static void term_execute_command(TerminalState *t, const char *cmd_raw) {
-    // Trim leading spaces
-    const char *cmd = cmd_raw;
-    while (*cmd == ' ') ++cmd;
-
-    uint32_t len = str_len(cmd);
-    if (len == 0) return;
-
-    // Echo the command itself
-    char echo_buf[TERM_MAX_COLS];
-    uint32_t pos = 0;
-    echo_buf[pos++] = '>';
-    echo_buf[pos++] = ' ';
-    for (uint32_t i = 0; i < len && pos < TERM_MAX_COLS - 1; ++i) {
-        echo_buf[pos++] = cmd[i];
-    }
-    echo_buf[pos] = '\0';
-    term_add_line(t, echo_buf);
-
-    // HELP (Windows-style and Linux-style)
-    if (str_eq(cmd, "help") || str_eq(cmd, "/?")) {
-        term_add_line(t, "SUPPORTED COMMANDS:");
-        term_add_line(t, "  HELP");
-        term_add_line(t, "  CLS / CLEAR");
-        term_add_line(t, "  DIR / LS");
-        term_add_line(t, "  VER / UNAME");
-        term_add_line(t, "  TIME, DATE");
-        term_add_line(t, "  ECHO <TEXT>");
+    // HELP
+    if (str_starts_with(cmd, "help")) {
+        term_add_line(t, "Supported commands:");
+        term_add_line(t, "  help");
+        term_add_line(t, "  cls / clear");
+        term_add_line(t, "  dir / ls");
+        term_add_line(t, "  ver / uname");
+        term_add_line(t, "  time / date");
+        term_add_line(t, "  echo <text>");
+        term_add_line(t, "");
+        term_add_line(t, "Note: only very basic DOS/Linux-like");
+        term_add_line(t, "      commands are simulated.");
         return;
     }
 
-    // CLEAR
-    if (str_eq(cmd, "cls") || str_eq(cmd, "clear")) {
-        term_init(t);
+    // CLS / CLEAR
+    if (str_starts_with(cmd, "cls") || str_starts_with(cmd, "clear")) {
+        term_reset(t);
         return;
     }
 
-    // DIR / LS (fake directory listing)
-    if (str_eq(cmd, "dir") || str_eq(cmd, "ls")) {
-        term_add_line(t, "Volume in drive C is LIGHTOS");
-        term_add_line(t, "Directory of C:/");
-        term_add_line(t, "  KERNEL   SYS");
-        term_add_line(t, "  BOOT     UEFI");
-        term_add_line(t, "  APPS     CMD");
-        term_add_line(t, "<NO REAL FILESYSTEM YET>");
+    // DIR / LS
+    if (str_starts_with(cmd, "dir") || str_starts_with(cmd, "ls")) {
+        term_add_line(t, "Directory listing is not implemented");
+        term_add_line(t, "(this is a demo Command Block).");
         return;
     }
 
     // VER / UNAME
-    if (str_eq(cmd, "ver") || str_eq(cmd, "uname") || str_eq(cmd, "uname -a")) {
-        term_add_line(t, "LightOS 4 (kernel 0.1)");
-        term_add_line(t, "x86_64, single core, no MMU");
+    if (str_starts_with(cmd, "ver") || str_starts_with(cmd, "uname")) {
+        term_add_line(t, "LightOS 4 (UEFI demo kernel)");
         return;
     }
 
-    // TIME / DATE (fake)
-    if (str_eq(cmd, "time")) {
-        term_add_line(t, "Current time: 12:34 (demo)");
-        return;
-    }
-    if (str_eq(cmd, "date")) {
-        term_add_line(t, "Current date: 2026-01-19 (demo)");
+    // TIME / DATE  (we don't have RTC yet, so fake it)
+    if (str_starts_with(cmd, "time") || str_starts_with(cmd, "date")) {
+        term_add_line(t, "2026-01-19 12:34:56 (static demo time)");
         return;
     }
 
@@ -655,16 +483,6 @@ static void term_execute_command(TerminalState *t, const char *cmd_raw) {
         if (*p == ' ') ++p;
         if (*p == '\0') term_add_line(t, "");
         else            term_add_line(t, p);
-        return;
-    }
-
-    // Stub hooks for future Windows/Linux-style commands
-    if (str_starts_with(cmd, "cd ") || str_eq(cmd, "cd")) {
-        term_add_line(t, "Directory changing not implemented yet.");
-        return;
-    }
-    if (str_starts_with(cmd, "start ") || str_starts_with(cmd, "./")) {
-        term_add_line(t, "Program execution not implemented yet.");
         return;
     }
 
@@ -693,133 +511,145 @@ static void term_handle_scancode(uint8_t sc, TerminalState *t,
 
     if (sc == 0x1C) {            // Enter
         t->input[t->input_len] = '\0';
+        term_add_line(t, t->input);
         term_execute_command(t, t->input);
         t->input_len = 0;
-        t->input[0] = '\0';
+        t->input[0]  = '\0';
         return;
     }
 
-    char ch = scancode_to_char(sc);
-    if (ch != 0 && t->input_len < TERM_MAX_COLS - 1) {
-        t->input[t->input_len++] = ch;
+    // limited scancode -> ASCII (only letters, digits, space)
+    char c = 0;
+    switch (sc) {
+        case 0x02: c = '1'; break;
+        case 0x03: c = '2'; break;
+        case 0x04: c = '3'; break;
+        case 0x05: c = '4'; break;
+        case 0x06: c = '5'; break;
+        case 0x07: c = '6'; break;
+        case 0x08: c = '7'; break;
+        case 0x09: c = '8'; break;
+        case 0x0A: c = '9'; break;
+        case 0x0B: c = '0'; break;
+        case 0x10: c = 'q'; break;
+        case 0x11: c = 'w'; break;
+        case 0x12: c = 'e'; break;
+        case 0x13: c = 'r'; break;
+        case 0x14: c = 't'; break;
+        case 0x15: c = 'y'; break;
+        case 0x16: c = 'u'; break;
+        case 0x17: c = 'i'; break;
+        case 0x18: c = 'o'; break;
+        case 0x19: c = 'p'; break;
+        case 0x1E: c = 'a'; break;
+        case 0x1F: c = 's'; break;
+        case 0x20: c = 'd'; break;
+        case 0x21: c = 'f'; break;
+        case 0x22: c = 'g'; break;
+        case 0x23: c = 'h'; break;
+        case 0x24: c = 'j'; break;
+        case 0x25: c = 'k'; break;
+        case 0x26: c = 'l'; break;
+        case 0x2C: c = 'z'; break;
+        case 0x2D: c = 'x'; break;
+        case 0x2E: c = 'c'; break;
+        case 0x2F: c = 'v'; break;
+        case 0x30: c = 'b'; break;
+        case 0x31: c = 'n'; break;
+        case 0x32: c = 'm'; break;
+        case 0x39: c = ' '; break;
+        default: break;
+    }
+
+    if (c != 0 && t->input_len < TERM_MAX_COLS - 1) {
+        t->input[t->input_len++] = c;
         t->input[t->input_len]   = '\0';
     }
 }
 
 // ---------------------------------------------------------------------
-// Desktop widgets & main window
+// Desktop + windows
 // ---------------------------------------------------------------------
 
-static void draw_wifi_icon(uint32_t x, uint32_t y, uint32_t size) {
-    uint32_t bar_h = size / 5;
-    if (bar_h < 2) bar_h = 2;
-
-    // Fake full signal bars
-    fill_rect(x,              y + size - bar_h,      size / 4, bar_h, 0xFFFFFFu);
-    fill_rect(x + size / 3,   y + size - 2 * bar_h,  size / 4, bar_h, 0xFFFFFFu);
-    fill_rect(x + 2*size / 3, y + size - 3 * bar_h,  size / 4, bar_h, 0xFFFFFFu);
+static void draw_dock_icon(uint32_t x, uint32_t y,
+                           uint32_t w, uint32_t h,
+                           uint32_t color) {
+    fill_rect(x, y, w, h, color);
+    draw_rect(x, y, w, h, 0x000000);
 }
 
-static void draw_battery_icon(uint32_t x, uint32_t y,
-                              uint32_t w, uint32_t h,
-                              uint32_t percent) {
-    if (w < 18) w = 18;
-    if (h < 8)  h = 8;
-    uint32_t border = 2;
-
-    // Frame
-    fill_rect(x, y, w, h, 0xFFFFFFu);
-    fill_rect(x + border, y + border,
-              w - 2 * border, h - 2 * border, 0x202020u);
-
-    if (percent > 100) percent = 100;
-    uint32_t inner_w = w - 2 * border;
-    uint32_t fill_w  = (inner_w * percent) / 100;
-    uint32_t color   = (percent < 25) ? 0xC00000u : 0x00C000u;
-
-    fill_rect(x + border, y + border,
-              fill_w, h - 2 * border, color);
-
-    // Little nub
-    uint32_t nub_w = w / 8;
-    if (nub_w < 2) nub_w = 2;
-    fill_rect(x + w, y + h / 3, nub_w, h / 3, 0xFFFFFFu);
+static void draw_desktop_background(void) {
+    fill_rect(0, 0, g_width, g_height, 0x003366); // blue wallpaper
 }
 
-static void draw_speaker_icon(uint32_t x, uint32_t y, uint32_t size) {
-    uint32_t box = size / 2;
-    if (box < 4) box = 4;
-    fill_rect(x, y + (size - box) / 2, box, box, 0xFFFFFFu);
-    fill_rect(x + box, y + (size - box) / 2 + box / 4,
-              box / 2, box / 2, 0xFFFFFFu);
+static void draw_taskbar(void) {
+    uint32_t bar_h = g_height / 10;
+    if (bar_h < 40) bar_h = 40;
+    uint32_t y = g_height - bar_h;
+    fill_rect(0, y, g_width, bar_h, 0x202020);
+
+    // fake clock and battery (bottom-right)
+    char buf[32];
+    // static time, the real RTC is not wired yet
+    buf[0] = '1'; buf[1] = '2'; buf[2] = ':'; buf[3] = '3'; buf[4] = '4';
+    buf[5] = '\0';
+    draw_text(g_width - 160, y + 8, buf, 0xFFFFFF, 1);
+    draw_text(g_width - 160, y + 24, "2026-01-19", 0xFFFFFF, 1);
+
+    // simple battery icon
+    uint32_t bx = g_width - 60;
+    uint32_t by = y + 8;
+    uint32_t bw = 40;
+    uint32_t bh = 20;
+    draw_rect(bx, by, bw, bh, 0xFFFFFF);
+    fill_rect(bx + 2, by + 2, bw - 4, bh - 4, 0x00CC00);
+    fill_rect(bx + bw, by + bh / 4, 4, bh / 2, 0xFFFFFF);
 }
 
-static void draw_clock_box(uint32_t x, uint32_t y,
-                           uint32_t w, uint32_t h) {
-    // Static time/date placeholder
-    fill_rect(x, y, w, h, 0x404040u);
-    draw_text(x + 4, y + 2,         "12:34",      0xFFFFFFu, 1);
-    draw_text(x + 4, y + h / 2 + 1, "2026-01-19", 0xC0C0C0u, 1);
-}
-
-// Left column: 5 app icons, with selection highlight
-static void draw_app_icons(int selected) {
-    uint32_t icon_w = g_width / 18;
-    uint32_t icon_h = g_height / 11;
+static void draw_icons_column(int selected_icon) {
+    uint32_t icon_w = g_width / 20;
     if (icon_w < 40) icon_w = 40;
-    if (icon_h < 40) icon_h = 40;
+    uint32_t icon_h = icon_w;
+    uint32_t gap    = icon_h / 4;
 
-    uint32_t gap = icon_h / 5;
-    uint32_t x   = icon_w / 2;
-    uint32_t y   = icon_h / 2;
+    uint32_t x = g_width / 40;
+    uint32_t y = g_height / 12;
 
-    uint32_t panel_bg = 0x003366u;
-    fill_rect(0, 0, x + icon_w + gap, g_height, panel_bg);
+    for (int i = 0; i < 5; ++i) {
+        uint32_t col = 0xAAAAAA;
+        if (i == selected_icon) col = 0xFFFFFF;
 
-    for (int idx = 0; idx < 5; ++idx) {
-        uint32_t bg = (idx == selected) ? 0x4C7AB5u : 0x234567u;
-        fill_rect(x, y, icon_w, icon_h, bg);
+        draw_dock_icon(x, y, icon_w, icon_h, col);
 
-        uint32_t inner_x = x + icon_w / 8;
-        uint32_t inner_y = y + icon_h / 8;
-        uint32_t inner_w = icon_w * 3 / 4;
-        uint32_t inner_h = icon_h * 3 / 4;
+        // simple inner glyph so each icon looks different
+        uint32_t inner_x = x + icon_w / 4;
+        uint32_t inner_y = y + icon_h / 4;
+        uint32_t inner_w = icon_w / 2;
+        uint32_t inner_h = icon_h / 2;
 
-        switch (idx) {
-            case 0: // Settings (simple square)
-                fill_rect(inner_x, inner_y, inner_w, inner_h, 0xE0E0E0u);
+        switch (i) {
+            case 0: // Settings: gear-like
+                draw_rect(inner_x, inner_y, inner_w, inner_h, 0x000000);
                 break;
-            case 1: // File Block (folder)
-                fill_rect(inner_x, inner_y + inner_h / 4,
-                          inner_w, inner_h * 3 / 4, 0xFFE79Cu);
+            case 1: // File Block: folder
+                fill_rect(inner_x, inner_y + inner_h/3,
+                          inner_w, inner_h*2/3, 0xFFFFAA);
                 fill_rect(inner_x, inner_y,
-                          inner_w / 2, inner_h / 3, 0xFFE79Cu);
+                          inner_w/2, inner_h/3, 0xFFFFAA);
                 break;
-            case 2: // Command Block
-                fill_rect(inner_x, inner_y, inner_w, inner_h, 0x000000u);
-                fill_rect(inner_x + inner_w / 6,
-                          inner_y + inner_h / 2,
-                          inner_w / 5, inner_h / 10, 0x00FF00u);
+            case 2: // Command Block: terminal
+                fill_rect(inner_x, inner_y,
+                          inner_w, inner_h, 0x000000);
+                draw_text(inner_x+2, inner_y+2, ">", 0x00FF00, 1);
                 break;
-            case 3: { // Browser (blue circle)
-                uint32_t cx = inner_x + inner_w / 2;
-                uint32_t cy = inner_y + inner_h / 2;
-                uint32_t r  = inner_h / 3;
-                for (int32_t yy = -(int32_t)r; yy <= (int32_t)r; ++yy) {
-                    for (int32_t xx = -(int32_t)r; xx <= (int32_t)r; ++xx) {
-                        if (xx * xx + yy * yy <= (int32_t)r * (int32_t)r) {
-                            put_pixel(cx + xx, cy + yy, 0x3399FFu);
-                        }
-                    }
-                }
+            case 3: // Browser: globe-ish
+                fill_circle(inner_x + inner_w/2,
+                            inner_y + inner_h/2,
+                            inner_w/2, 0x99CCFF);
                 break;
-            }
-            case 4: // App Store (bag)
-                fill_rect(inner_x, inner_y + inner_h / 3,
-                          inner_w, inner_h * 2 / 3, 0xFFFFFFu);
-                fill_rect(inner_x + inner_w / 4,
-                          inner_y + inner_h / 3 - inner_h / 5,
-                          inner_w / 2, inner_h / 5, 0xFFFFFFu);
+            case 4: // placeholder app
+                fill_rect(inner_x, inner_y,
+                          inner_w, inner_h, 0xFFFFFF);
                 break;
         }
 
@@ -830,18 +660,16 @@ static void draw_app_icons(int selected) {
 static void draw_terminal_contents(uint32_t win_x, uint32_t win_y,
                                    uint32_t win_w, uint32_t win_h,
                                    uint32_t title_h) {
-    (void)win_w; // not currently used
-
     uint32_t x = win_x + 10;
     uint32_t y = win_y + title_h + 10;
 
     for (uint32_t i = 0; i < g_term.line_count; ++i) {
-        draw_text(x, y, g_term.lines[i], 0xFFFFFFu, 1);
+        draw_text(x, y, g_term.lines[i], 0xFFFFFF, 1);
         y += 12;
         if (y + 12 >= win_y + win_h) break;
     }
 
-    // Prompt
+    // prompt
     if (y + 16 < win_y + win_h) {
         char buf[TERM_MAX_COLS];
         buf[0] = '>';
@@ -851,147 +679,126 @@ static void draw_terminal_contents(uint32_t win_x, uint32_t win_y,
         for (uint32_t i = 0; i < len; ++i) {
             buf[2 + i] = g_term.input[i];
         }
-        buf[2 + len] = '\0';
-        draw_text(x, y + 4, buf, 0x00FF00u, 1);
+        buf[2 + len] = '_';
+        buf[3 + len] = '\0';
+        draw_text(x, y + 4, buf, 0xFFFFFF, 1);
     }
 }
 
-static void draw_main_window(int open_app) {
-    uint32_t win_w = (g_width * 3) / 5;
-    uint32_t win_h = (g_height * 3) / 5;
-    uint32_t win_x = (g_width - win_w) / 2;
-    uint32_t win_y = (g_height - win_h) / 2;
-    if (win_y < 10) win_y = 10;
+static void draw_window_frame(uint32_t win_x, uint32_t win_y,
+                              uint32_t win_w, uint32_t win_h,
+                              const char *title,
+                              int open_app) {
+    uint32_t title_h = 24;
 
-    uint32_t border_col = 0x000000u;
-    uint32_t title_col  = 0x004080u;
-    uint32_t body_col   = 0xC0C0C0u;
+    // background
+    fill_rect(win_x, win_y, win_w, win_h, 0x202020);
+    draw_rect(win_x, win_y, win_w, win_h, 0x000000);
 
+    // title bar
+    fill_rect(win_x, win_y, win_w, title_h, 0x303030);
+    draw_rect(win_x, win_y, win_w, title_h, 0x000000);
+    draw_text(win_x + 8, win_y + 6, title, 0xFFFFFF, 1);
+
+    // close button
+    uint32_t close_w = 18;
+    uint32_t close_x = win_x + win_w - close_w - 6;
+    uint32_t close_y = win_y + 4;
+    fill_rect(close_x, close_y, close_w, title_h - 8, 0x880000);
+
+    // window contents
     switch (open_app) {
-        case 0: body_col = 0xCCE8FFu; title_col = 0x0055AAu; break; // Settings
-        case 1: body_col = 0xFFF0C0u; title_col = 0xAA7700u; break; // File Block
-        case 2: body_col = 0x101010u; title_col = 0x202020u; break; // Command Block
-        case 3: body_col = 0xE0F4FFu; title_col = 0x0066BBu; break; // Browser
-        case 4: body_col = 0xF4E0FFu; title_col = 0x664488u; break; // App Store
-        default: break;
-    }
-
-    // Border
-    fill_rect(win_x - 1, win_y - 1, win_w + 2, win_h + 2, border_col);
-
-    // Title bar
-    uint32_t title_h = 28;
-    fill_rect(win_x, win_y, win_w, title_h, title_col);
-
-    // Window body
-    fill_rect(win_x, win_y + title_h, win_w, win_h - title_h, body_col);
-
-    // Close button (just visual)
-    uint32_t btn   = (title_h > 8) ? (title_h - 8) : (title_h / 2);
-    uint32_t btn_x = win_x + win_w - btn - 4;
-    uint32_t btn_y = win_y + (title_h - btn) / 2;
-    fill_rect(btn_x, btn_y, btn, btn, 0x800000u);
-
-    // Command Block contents
-    if (open_app == 2) {
-        draw_terminal_contents(win_x, win_y, win_w, win_h, title_h);
+        case 0: // Settings
+            draw_text(win_x + 10, win_y + title_h + 10,
+                      "Settings app is not implemented yet.",
+                      0xFFFFFF, 1);
+            break;
+        case 1: // File Block
+            draw_text(win_x + 10, win_y + title_h + 10,
+                      "File Block (file manager) is not implemented yet.",
+                      0xFFFFFF, 1);
+            break;
+        case 2: // Command Block (terminal)
+            draw_terminal_contents(win_x, win_y, win_w, win_h, title_h);
+            break;
+        case 3: // Browser placeholder
+            draw_text(win_x + 10, win_y + title_h + 10,
+                      "Browser is not implemented yet.",
+                      0xFFFFFF, 1);
+            draw_text(win_x + 10, win_y + title_h + 26,
+                      "(Any working browser here will be a big W.)",
+                      0xFFFFFF, 1);
+            break;
+        case 4: // extra app
+            draw_text(win_x + 10, win_y + title_h + 10,
+                      "Extra app placeholder.",
+                      0xFFFFFF, 1);
+            break;
+        default:
+            break;
     }
 }
 
 static void draw_desktop(int selected_icon, int open_app) {
-    uint32_t desktop_bg = 0x003366u;
-    uint32_t panel_bg   = 0x202020u;
+    draw_desktop_background();
+    draw_taskbar();
+    draw_icons_column(selected_icon);
 
-    // Background
-    fill_rect(0, 0, g_width, g_height, desktop_bg);
+    if (open_app >= 0) {
+        uint32_t win_w = g_width * 3 / 5;
+        uint32_t win_h = g_height * 3 / 5;
+        uint32_t win_x = (g_width  - win_w) / 2;
+        uint32_t win_y = (g_height - win_h) / 2 - g_height / 20;
 
-    // Taskbar
-    uint32_t panel_h = g_height / 12;
-    if (panel_h < 40) panel_h = 40;
-    uint32_t panel_y = g_height - panel_h;
-    fill_rect(0, panel_y, g_width, panel_h, panel_bg);
+        const char *title = "Window";
+        switch (open_app) {
+            case 0: title = "LightOS 4 Settings"; break;
+            case 1: title = "LightOS 4 File Block"; break;
+            case 2: title = "LightOS 4 Command Block"; break;
+            case 3: title = "LightOS 4 Browser"; break;
+            case 4: title = "LightOS 4 Extra"; break;
+        }
 
-    // Start block
-    uint32_t start_w = panel_h;
-    fill_rect(0, panel_y, start_w, panel_h, 0x404040u);
-
-    // Tray
-    uint32_t tray_w = g_width / 4;
-    if (tray_w < 220) tray_w = 220;
-    uint32_t tray_x = g_width - tray_w;
-    fill_rect(tray_x, panel_y, tray_w, panel_h, 0x303030u);
-
-    uint32_t icon_size = panel_h / 2;
-    if (icon_size < 16) icon_size = 16;
-    uint32_t icon_y = panel_y + (panel_h - icon_size) / 2;
-
-    uint32_t cursor_x = tray_x + tray_w - icon_size - 8;
-    draw_wifi_icon(cursor_x, icon_y, icon_size);
-    cursor_x -= icon_size + 8;
-
-    draw_speaker_icon(cursor_x, icon_y, icon_size);
-    cursor_x -= icon_size + 12;
-
-    draw_battery_icon(cursor_x, icon_y, icon_size * 3 / 2, icon_size, 76);
-    cursor_x -= icon_size * 2;
-
-    // Clock on left of tray
-    uint32_t clock_w = tray_w / 3;
-    uint32_t clock_h = icon_size + 10;
-    uint32_t clock_x = tray_x + 8;
-    uint32_t clock_y = panel_y + (panel_h - clock_h) / 2;
-    draw_clock_box(clock_x, clock_y, clock_w, clock_h);
-
-    // App icons + active window
-    draw_app_icons(selected_icon);
-    draw_main_window(open_app);
+        draw_window_frame(win_x, win_y, win_w, win_h, title, open_app);
+    }
 }
 
 // ---------------------------------------------------------------------
-// Keyboard navigation (desktop-level)
+// Navigation / input on desktop
 // ---------------------------------------------------------------------
 
 static void handle_nav_scancode(uint8_t sc,
                                 int *selected_icon,
                                 int *open_app) {
-    static uint8_t ext = 0;
+    if (sc == 0xE0) return;      // ignore extended prefix
+    if (sc & 0x80) return;       // ignore key releases
 
-    if (sc == 0xE0) {
-        ext = 1;
+    // arrow up / down
+    if (sc == 0x48) {            // up arrow
+        if (*selected_icon > 0) (*selected_icon)--;
+        return;
+    }
+    if (sc == 0x50) {            // down arrow
+        if (*selected_icon < 4) (*selected_icon)++;
         return;
     }
 
-    if (ext) {
-        uint8_t code = sc & 0x7Fu;
-        if (!(sc & 0x80u)) {
-            switch (code) {
-                case 0x48: // Up
-                    if (*selected_icon > 0) (*selected_icon)--;
-                    else *selected_icon = 4;
-                    break;
-                case 0x50: // Down
-                    if (*selected_icon < 4) (*selected_icon)++;
-                    else *selected_icon = 0;
-                    break;
-                default:
-                    break;
+    // Enter: open app
+    if (sc == 0x1C) {
+        if (*selected_icon >= 0 && *selected_icon <= 4) {
+            *open_app = *selected_icon;
+            // entering Command Block: reset / greet
+            if (*open_app == 2) {
+                term_reset(&g_term);
             }
         }
-        ext = 0;
         return;
     }
 
-    if (sc & 0x80u) return; // key release
-
-    switch (sc) {
-        case 0x1C: // Enter
-            *open_app = *selected_icon;
-            break;
-        case 0x01: // Esc
-            *open_app = -1;
-            break;
-        default:
-            break;
+    // Esc: close window
+    if (sc == 0x01) {
+        *open_app = -1;
+        return;
     }
 }
 
@@ -999,25 +806,20 @@ static void handle_nav_scancode(uint8_t sc,
 // Kernel entry
 // ---------------------------------------------------------------------
 
-__attribute__((noreturn))
-void kernel_main(BootInfo *bi) {
-    g_fb     = (uint32_t*)(uintptr_t)bi->framebuffer_base;
-    g_width  = bi->framebuffer_width;
-    g_height = bi->framebuffer_height;
-    g_pitch  = bi->framebuffer_pitch;
+void kernel_main(BootInfo *boot) {
+    g_fb     = (uint32_t*)(uintptr_t)boot->framebuffer_base;
+    g_width  = boot->framebuffer_width;
+    g_height = boot->framebuffer_height;
+    g_pitch  = boot->framebuffer_pitch ? boot->framebuffer_pitch : g_width;
 
-    // 1) Boot splash
     run_boot_splash();
 
-    // 2) Desktop + Command Block
-    term_init(&g_term);
-
-    int selected_icon = 2;   // default to Command Block icon
-    int open_app      = 2;   // open Command Block on boot
+    int selected_icon = 2;  // default highlight Command Block
+    int open_app      = -1;
 
     draw_desktop(selected_icon, open_app);
 
-    for (;;) {
+    while (1) {
         uint8_t sc;
         if (keyboard_poll(&sc)) {
             int prev_sel  = selected_icon;
@@ -1027,30 +829,15 @@ void kernel_main(BootInfo *bi) {
                 // Command Block takes over keyboard
                 term_handle_scancode(sc, &g_term, &selected_icon, &open_app);
             } else {
-                // Desktop navigation
                 handle_nav_scancode(sc, &selected_icon, &open_app);
             }
 
-            // Redraw when something changed, or while typing in Command Block
+            // redraw on change, or while typing into terminal
             if (selected_icon != prev_sel ||
                 open_app      != prev_open ||
                 open_app == 2) {
                 draw_desktop(selected_icon, open_app);
             }
         }
-    }
-}
-
-// ---------------------------------------------------------------------
-// Binary entry stub
-// This is placed in the .entry section at 0x00100000 and immediately
-// calls kernel_main(). The UEFI loader jumps here.
-// ---------------------------------------------------------------------
-
-__attribute__((noreturn, section(".entry")))
-void _start(BootInfo *bi) {
-    kernel_main(bi);
-    for (;;) {
-        __asm__ volatile("hlt");
     }
 }
