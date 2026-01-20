@@ -3,8 +3,8 @@
 
 #include <stdint.h>
 
-// BootInfo is passed from the UEFI loader into the kernel.
-// Now includes framebuffer info + current RTC date/time at boot.
+// This structure is passed from the UEFI loader to the kernel.
+// We extended it with RTC date/time so the kernel can show a real clock.
 typedef struct {
     uint64_t framebuffer_base;
     uint32_t framebuffer_width;
