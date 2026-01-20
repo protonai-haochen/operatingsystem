@@ -11,6 +11,13 @@ typedef struct {
     uint32_t framebuffer_width;
     uint32_t framebuffer_height;
     uint32_t framebuffer_pitch;
+
+    uint16_t year;
+    uint8_t  month;
+    uint8_t  day;
+    uint8_t  hour;
+    uint8_t  minute;
+    uint8_t  second;
 } BootInfo;
 
 // Kernel entry: must match kernel/core/kernel.c
@@ -153,13 +160,43 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     bi.framebuffer_height = Gop->Mode->Info->VerticalResolution;
     bi.framebuffer_pitch  = Gop->Mode->Info->PixelsPerScanLine;
 
+    // Default time fields to 0 in case RTC call fails
+    bi.year   = 0;
+    bi.month  = 0;
+    bi.day    = 0;
+    bi.hour   = 0;
+    bi.minute = 0;
+    bi.second = 0;
+
+    // --- 7. Read current RTC time via UEFI Runtime Services ---
+    EFI_TIME Time;
+    Status = uefi_call_wrapper(RT->GetTime, 2, &Time, NULL);
+    if (!EFI_ERROR(Status)) {
+        bi.year   = Time.Year;
+        bi.month  = Time.Month;
+        bi.day    = Time.Day;
+        bi.hour   = Time.Hour;
+        bi.minute = Time.Minute;
+        bi.second = Time.Second;
+
+        Print(L"[boot] RTC time: %u-%02u-%02u %02u:%02u:%02u\r\n",
+              Time.Year,
+              (UINTN)Time.Month,
+              (UINTN)Time.Day,
+              (UINTN)Time.Hour,
+              (UINTN)Time.Minute,
+              (UINTN)Time.Second);
+    } else {
+        Print(L"[boot] GetTime() failed: %r (clock will show default)\r\n", Status);
+    }
+
     Print(L"[boot] Framebuffer @ 0x%lx (%ux%u, pitch %u)\r\n",
           (UINT64)bi.framebuffer_base,
           bi.framebuffer_width,
           bi.framebuffer_height,
           bi.framebuffer_pitch);
 
-    // --- 7. Jump to kernel entry point ---
+    // --- 8. Jump to kernel entry point ---
     kernel_entry_t entry = (kernel_entry_t)(UINTN)KERNEL_LOAD_ADDR;
 
     Print(L"[boot] Jumping to kernel at 0x%lx\r\n", (UINT64)KERNEL_LOAD_ADDR);
