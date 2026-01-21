@@ -466,6 +466,9 @@ typedef struct {
 
 static MouseState g_mouse = { 80, 80, 0, 0 };
 
+static uint8_t g_prev_left  = 0;
+static uint8_t g_prev_right = 0;
+
 // Draw simple arrow cursor
 static void draw_mouse_cursor(void) {
     const uint32_t col_fg = 0xFFFFFFu;
@@ -1417,7 +1420,8 @@ typedef struct {
 } BrowserTab;
 
 static BrowserTab g_tabs[3];
-static int        g_active_tab = 0;
+static int        g_active_tab    = 0;
+static int        g_browser_scroll = 0;
 
 // Stub net: replace later with real NIC + TCP/IP
 static int net_http_get(const char *url, char *buf, uint32_t max_len) {
@@ -1433,6 +1437,7 @@ static int net_http_get(const char *url, char *buf, uint32_t max_len) {
 }
 
 static void browser_init(void) {
+    g_browser_scroll = 0;
     str_copy(g_tabs[0].title, "Home", sizeof(g_tabs[0].title));
     str_copy(g_tabs[0].url,   "https://lightos.local/home", sizeof(g_tabs[0].url));
     str_copy(g_tabs[0].content,
@@ -1483,13 +1488,23 @@ static void draw_browser_contents(uint32_t win_x, uint32_t win_y,
     draw_text(addr_x + 4, y + 2, g_tabs[g_active_tab].url, 0x000000u, 1);
     y += addr_h + 6;
 
-    // Content
+    // Content (scrollable via g_browser_scroll)
     char buf[512];
     str_copy(buf, g_tabs[g_active_tab].content, sizeof(buf));
     uint32_t cx = win_x + 10;
     uint32_t cy = y;
 
+    // Skip lines according to scroll offset
     char *p = buf;
+    int skip = g_browser_scroll;
+    while (*p && skip > 0) {
+        while (*p && *p != '\n') ++p;
+        if (*p == '\n') {
+            ++p;
+        }
+        --skip;
+    }
+
     while (*p && cy + 12 < win_y + win_h) {
         char *line = p;
         while (*p && *p != '\n') ++p;
@@ -1577,6 +1592,210 @@ static void draw_desktop(int selected_icon, int open_app) {
     draw_mouse_cursor();
 }
 
+
+// ---------------------------------------------------------------------
+// Mouse → UI hit-testing (icons, Start menu, windows, browser)
+// ---------------------------------------------------------------------
+
+static void handle_browser_click(uint32_t win_x, uint32_t win_y,
+                                 uint32_t win_w, uint32_t win_h,
+                                 int mouse_x, int mouse_y,
+                                 int left, int right,
+                                 int *need_redraw) {
+    (void)right;
+    if (!left) return;
+
+    uint32_t title_h = 24;
+
+    // Tab bar geometry
+    uint32_t tab_h = 20;
+    uint32_t tab_w = win_w / 3;
+    uint32_t tab_y = win_y + title_h;
+
+    if ((uint32_t)mouse_y >= tab_y && (uint32_t)mouse_y < tab_y + tab_h) {
+        for (int i = 0; i < 3; ++i) {
+            uint32_t tx = win_x + (uint32_t)i * tab_w;
+            if ((uint32_t)mouse_x >= tx && (uint32_t)mouse_x < tx + tab_w) {
+                g_active_tab = i;
+                g_browser_scroll = 0;
+                if (need_redraw) *need_redraw = 1;
+                return;
+            }
+        }
+    }
+
+    // Content area geometry
+    uint32_t addr_h = 16;
+    uint32_t y_addr = tab_y + tab_h + 4;
+    uint32_t content_top    = y_addr + addr_h + 6;
+    uint32_t content_bottom = win_y + win_h;
+    if ((uint32_t)mouse_y < content_top || (uint32_t)mouse_y >= content_bottom) {
+        return;
+    }
+
+    // Compute how many lines exist in the active tab
+    const char *content = g_tabs[g_active_tab].content;
+    int total_lines = 0;
+    for (const char *p = content; *p; ++p) {
+        if (*p == '\n') {
+            total_lines++;
+        }
+    }
+    total_lines++; // last line
+
+    int visible_lines = (int)((content_bottom - content_top) / 12);
+    if (visible_lines < 1) visible_lines = 1;
+
+    int max_scroll = total_lines - visible_lines;
+    if (max_scroll < 0) max_scroll = 0;
+
+    int mid = (int)(content_top + content_bottom) / 2;
+    if (mouse_y < mid) {
+        g_browser_scroll -= 3;
+    } else {
+        g_browser_scroll += 3;
+    }
+    if (g_browser_scroll < 0) g_browser_scroll = 0;
+    if (g_browser_scroll > max_scroll) g_browser_scroll = max_scroll;
+
+    if (need_redraw) *need_redraw = 1;
+}
+
+static void handle_mouse_click(int mouse_x, int mouse_y,
+                               int left, int right,
+                               int *selected_icon, int *open_app,
+                               int *need_redraw) {
+    (void)right;
+
+    if (!selected_icon || !open_app) return;
+
+    int handled = 0;
+
+    // Taskbar geometry
+    uint32_t bar_h = g_height / 12;
+    if (bar_h < 40) bar_h = 40;
+    uint32_t tb_y = g_height - bar_h;
+
+    // Start button bounds
+    uint32_t sx = 8;
+    uint32_t sy = tb_y + 6;
+    uint32_t sw = 80;
+    uint32_t sh = bar_h - 12;
+
+    if (left &&
+        (uint32_t)mouse_x >= sx && (uint32_t)mouse_x < sx + sw &&
+        (uint32_t)mouse_y >= sy && (uint32_t)mouse_y < sy + sh) {
+        g_start_open = !g_start_open;
+        handled = 1;
+        if (need_redraw) *need_redraw = 1;
+        return;
+    }
+
+    // Start menu geometry
+    if (g_start_open) {
+        uint32_t h = g_height / 2;
+        uint32_t w = g_width / 3;
+        uint32_t mx = 8;
+        uint32_t my = g_height - bar_h - h - 8;
+
+        if ((uint32_t)mouse_x >= mx && (uint32_t)mouse_x < mx + w &&
+            (uint32_t)mouse_y >= my && (uint32_t)mouse_y < my + h) {
+
+            uint32_t ax = mx + 16;
+            uint32_t ay = my + 40;
+            uint32_t row_h = 16;
+            int index = -1;
+
+            for (int i = 0; i < 4; ++i) {
+                uint32_t ry0 = ay + (uint32_t)i * row_h;
+                uint32_t ry1 = ry0 + row_h;
+                if ((uint32_t)mouse_x >= ax && (uint32_t)mouse_x < mx + w - 16 &&
+                    (uint32_t)mouse_y >= ry0 && (uint32_t)mouse_y < ry1) {
+                    index = i;
+                    break;
+                }
+            }
+
+            if (index >= 0) {
+                *selected_icon = index;
+                *open_app      = index;
+                if (*open_app == 2) {
+                    term_reset(&g_term);
+                }
+                g_start_open = 0;
+                handled = 1;
+                if (need_redraw) *need_redraw = 1;
+                return;
+            }
+
+            handled = 1; // click inside menu but not on an item; keep it open
+        } else {
+            // Click outside the menu → close it
+            g_start_open = 0;
+            if (need_redraw) *need_redraw = 1;
+        }
+    }
+
+    if (!handled) {
+        g_start_open = 0; // any non-start click closes the menu
+    }
+
+    // Dock icons (left column)
+    if (left) {
+        uint32_t icon_w = g_width / 16;
+        if (icon_w < 40) icon_w = 40;
+        uint32_t icon_h = icon_w;
+        uint32_t gap    = icon_h / 4;
+
+        uint32_t x = g_width / 40;
+        uint32_t y = g_height / 7;
+
+        for (int i = 0; i < 5; ++i) {
+            if ((uint32_t)mouse_x >= x && (uint32_t)mouse_x < x + icon_w &&
+                (uint32_t)mouse_y >= y && (uint32_t)mouse_y < y + icon_h) {
+                *selected_icon = i;
+                *open_app      = i;
+                if (*open_app == 2) {
+                    term_reset(&g_term);
+                }
+                if (need_redraw) *need_redraw = 1;
+                return;
+            }
+            y += icon_h + gap;
+        }
+    }
+
+    // Window close button + browser tab/content clicks when an app is open
+    if (*open_app >= 0 && left) {
+        uint32_t win_w = g_width * 3 / 5;
+        uint32_t win_h = g_height * 3 / 5;
+        uint32_t win_x = (g_width  - win_w) / 2;
+        uint32_t win_y = (g_height - win_h) / 2 - g_height / 20;
+        if (win_y < 10) win_y = 10;
+
+        uint32_t title_h = 24;
+
+        // Close button in title bar
+        uint32_t bx = win_x + win_w - 20;
+        uint32_t by = win_y + 4;
+        uint32_t bw = 14;
+        uint32_t bh = 14;
+
+        if ((uint32_t)mouse_x >= bx && (uint32_t)mouse_x < bx + bw &&
+            (uint32_t)mouse_y >= by && (uint32_t)mouse_y < by + bh) {
+            *open_app = -1;
+            if (need_redraw) *need_redraw = 1;
+            return;
+        }
+
+        // Browser-specific hit testing for tabs + scroll
+        if (*open_app == 3) {
+            handle_browser_click(win_x, win_y, win_w, win_h,
+                                 mouse_x, mouse_y, left, right, need_redraw);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------
 // Desktop keyboard navigation (arrows, Start toggle)
 // ---------------------------------------------------------------------
@@ -1634,7 +1853,10 @@ static void ps2_write_mouse(uint8_t val) {
     outb(0x60, val);
 }
 
-static void ps2_mouse_process_byte(uint8_t data, int *need_redraw) {
+static void ps2_mouse_process_byte(uint8_t data,
+                                   int *selected_icon,
+                                   int *open_app,
+                                   int *need_redraw) {
     if (mouse_cycle == 0) {
         // First byte: always has bit 3 set in PS/2 packet; if not, resync
         if (!(data & 0x08)) {
@@ -1660,12 +1882,34 @@ static void ps2_mouse_process_byte(uint8_t data, int *need_redraw) {
         if ((uint32_t)g_mouse.x >= g_width)  g_mouse.x = (int32_t)g_width - 1;
         if ((uint32_t)g_mouse.y >= g_height) g_mouse.y = (int32_t)g_height - 1;
 
-        g_mouse.left_down  = (mouse_bytes[0] & 0x01) ? 1 : 0;
-        g_mouse.right_down = (mouse_bytes[0] & 0x02) ? 1 : 0;
+        uint8_t new_left  = (mouse_bytes[0] & 0x01) ? 1u : 0u;
+        uint8_t new_right = (mouse_bytes[0] & 0x02) ? 1u : 0u;
+
+        g_mouse.left_down  = new_left;
+        g_mouse.right_down = new_right;
+
+        // Edge-triggered click handling
+        if (selected_icon && open_app) {
+            if (new_left && !g_prev_left) {
+                handle_mouse_click(g_mouse.x, g_mouse.y,
+                                   1, 0,
+                                   selected_icon, open_app,
+                                   need_redraw);
+            } else if (new_right && !g_prev_right) {
+                handle_mouse_click(g_mouse.x, g_mouse.y,
+                                   0, 1,
+                                   selected_icon, open_app,
+                                   need_redraw);
+            }
+        }
+
+        g_prev_left  = new_left;
+        g_prev_right = new_right;
 
         if (need_redraw) *need_redraw = 1;
     }
 }
+
 
 static void ps2_mouse_init(void) {
     // Enable auxiliary device (mouse)
@@ -1693,7 +1937,7 @@ static void ps2_poll(int *selected_icon, int *open_app, int *need_redraw) {
 
     if (status & 0x20) {
         // Mouse data
-        ps2_mouse_process_byte(data, need_redraw);
+        ps2_mouse_process_byte(data, selected_icon, open_app, need_redraw);
     } else {
         // Keyboard scancode
         if (*open_app == 2) {
@@ -1715,8 +1959,20 @@ void kernel_main(BootInfo *bi) {
     g_height = bi->framebuffer_height;
     g_pitch  = bi->framebuffer_pitch ? bi->framebuffer_pitch : bi->framebuffer_width;
 
-    // Read time from CMOS RTC instead of uninitialised memory
-    rtc_read();
+    // Initialise time/date from UEFI BootInfo when available,
+    // fall back to CMOS RTC if firmware didn't give us anything useful.
+    if (bi &&
+        !(bi->year == 2026 && bi->month == 1 && bi->day == 1 &&
+          bi->hour == 0 && bi->minute == 0 && bi->second == 0)) {
+        g_year   = bi->year;
+        g_month  = bi->month;
+        g_day    = bi->day;
+        g_hour   = bi->hour;
+        g_minute = bi->minute;
+        g_second = bi->second;
+    } else {
+        rtc_read();
+    }
 
     vfs_init();
     browser_init();
