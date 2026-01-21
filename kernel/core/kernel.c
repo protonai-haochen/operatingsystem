@@ -1836,14 +1836,14 @@ static void draw_desktop(int selected_icon, int open_app) {
 static void draw_command_block_window(int selected_icon, int open_app) {
     (void)selected_icon; // currently unused
 
-    // Underlying window contents are about to be redrawn; discard any
-    // saved cursor background so we don't restore stale pixels.
-    cursor_invalidate();
-
     if (open_app != 2) {
         // Only Command Block uses the text terminal window.
         return;
     }
+
+    // We are about to redraw only the Command Block client area, so discard any
+    // saved cursor background from the previous frame.
+    cursor_invalidate();
 
     uint32_t win_w = g_width * 3 / 5;
     uint32_t win_h = g_height * 3 / 5;
@@ -1851,8 +1851,11 @@ static void draw_command_block_window(int selected_icon, int open_app) {
     uint32_t win_y = (g_height - win_h) / 2 - g_height / 20;
     if (win_y < 10) win_y = 10;
 
-    const char *title = "Command Block";
-    draw_window(win_x, win_y, win_w, win_h, title, open_app);
+    // The window frame/title bar/close button are drawn by draw_desktop()
+    // when the app is opened. For normal typing we only need to redraw the
+    // terminal contents to avoid repainting the whole desktop every keypress.
+    const uint32_t title_h = 24; // must stay in sync with draw_window().
+    draw_terminal_contents(win_x, win_y, win_w, win_h, title_h);
 
     // Cursor on top of everything
     draw_mouse_cursor();
