@@ -990,7 +990,21 @@ static void term_execute_command(TerminalState *t, const char *cmd) {
         return;
     }
 
-    // Unknown
+        // ipconfig / ifconfig (network stub)
+    if (str_eq(word, "ipconfig") || str_eq(word, "ifconfig")) {
+        term_add_line(t, "Network stack not implemented yet.");
+        term_add_line(t, "Once a NIC driver + TCP/IP stack exist,");
+        term_add_line(t, "ipconfig/ifconfig will show interface details.");
+        return;
+    }
+
+    // ping (network stub)
+    if (str_eq(word, "ping")) {
+        term_add_line(t, "ping: no network stack yet (no TCP/IP).");
+        return;
+    }
+
+// Unknown
     {
         char msg[TERM_MAX_COLS];
         str_copy(msg, "Unknown command: ", TERM_MAX_COLS);
@@ -1126,9 +1140,14 @@ static void term_handle_scancode(uint8_t sc, TerminalState *t,
 // ---------------------------------------------------------------------
 
 static int g_start_open = 0;
+static int g_context_menu_open = 0;
+static int g_context_menu_x = 0;
+static int g_context_menu_y = 0;
+
 
 // Forward declarations
 static void draw_desktop(int selected_icon, int open_app);
+static void draw_context_menu(int open_app);
 
 // Desktop background – ChromeOS-ish flat gradient
 static void draw_desktop_background(void) {
@@ -1563,11 +1582,59 @@ static void draw_window(uint32_t win_x, uint32_t win_y,
     }
 }
 
+static void draw_context_menu(int open_app) {
+    if (!g_context_menu_open) return;
+
+    int item_count = 3; // Settings, Command Block, About
+    if (open_app >= 0) {
+        item_count += 1; // "Close app" when something is open
+    }
+
+    if (item_count <= 0) return;
+
+    uint32_t w = 200;
+    uint32_t h = (uint32_t)item_count * 18 + 8;
+
+    int mx = g_context_menu_x;
+    int my = g_context_menu_y;
+
+    // Keep menu fully on-screen
+    if (mx < 0) mx = 0;
+    if (my < 0) my = 0;
+    if ((uint32_t)(mx + (int)w) > g_width) {
+        mx = (int)g_width - (int)w;
+        if (mx < 0) mx = 0;
+    }
+    if ((uint32_t)(my + (int)h) > g_height) {
+        my = (int)g_height - (int)h;
+        if (my < 0) my = 0;
+    }
+
+    // Background + border
+    fill_rect((uint32_t)mx, (uint32_t)my, w, h, 0x202020u);
+    draw_rect_border((uint32_t)mx, (uint32_t)my, w, h, 0xFFFFFFu);
+
+    int cy = my + 4;
+    draw_text((uint32_t)mx + 6, (uint32_t)cy, "Open Settings", 0xFFFFFFu, 1);
+    cy += 18;
+    draw_text((uint32_t)mx + 6, (uint32_t)cy, "Open Command Block", 0xFFFFFFu, 1);
+    cy += 18;
+    draw_text((uint32_t)mx + 6, (uint32_t)cy, "About LightOS 4", 0xFFFFFFu, 1);
+    cy += 18;
+
+    if (open_app >= 0) {
+        draw_text((uint32_t)mx + 6, (uint32_t)cy, "Close app", 0xFFFFFFu, 1);
+    }
+}
+
 static void draw_desktop(int selected_icon, int open_app) {
     draw_desktop_background();
     draw_taskbar();
     draw_icons_column(selected_icon);
     draw_start_menu();
+    if (g_context_menu_open) {
+        draw_context_menu(open_app);
+    }
 
     if (open_app >= 0) {
         uint32_t win_w = g_width * 3 / 5;
@@ -1665,8 +1732,6 @@ static void handle_mouse_click(int mouse_x, int mouse_y,
                                int left, int right,
                                int *selected_icon, int *open_app,
                                int *need_redraw) {
-    (void)right;
-
     if (!selected_icon || !open_app) return;
 
     int handled = 0;
@@ -1675,6 +1740,90 @@ static void handle_mouse_click(int mouse_x, int mouse_y,
     uint32_t bar_h = g_height / 12;
     if (bar_h < 40) bar_h = 40;
     uint32_t tb_y = g_height - bar_h;
+
+    // If a context menu is open, handle clicks there first.
+    if (g_context_menu_open && (left || right)) {
+        int item_count = 3;
+        if (*open_app >= 0) item_count += 1;
+
+        uint32_t w = 200;
+        uint32_t h = (uint32_t)item_count * 18 + 8;
+
+        int mx = g_context_menu_x;
+        int my = g_context_menu_y;
+
+        if (mx < 0) mx = 0;
+        if (my < 0) my = 0;
+        if ((uint32_t)(mx + (int)w) > g_width) {
+            mx = (int)g_width - (int)w;
+            if (mx < 0) mx = 0;
+        }
+        if ((uint32_t)(my + (int)h) > g_height) {
+            my = (int)g_height - (int)h;
+            if (my < 0) my = 0;
+        }
+
+        if ((uint32_t)mouse_x >= (uint32_t)mx &&
+            (uint32_t)mouse_x <  (uint32_t)(mx + (int)w) &&
+            (uint32_t)mouse_y >= (uint32_t)my &&
+            (uint32_t)mouse_y <  (uint32_t)(my + (int)h)) {
+
+            if (left) {
+                int cy = my + 4;
+                int index = -1;
+                for (int i = 0; i < item_count; ++i) {
+                    if (mouse_y >= cy && mouse_y < cy + 18) {
+                        index = i;
+                        break;
+                    }
+                    cy += 18;
+                }
+
+                if (index == 0) {
+                    // Open Settings
+                    *selected_icon = 0;
+                    *open_app      = 0;
+                    handled        = 1;
+                } else if (index == 1) {
+                    // Open Command Block
+                    *selected_icon = 2;
+                    *open_app      = 2;
+                    term_reset(&g_term);
+                    handled = 1;
+                } else if (index == 2) {
+                    // About: show a short line in Command Block
+                    if (*open_app != 2) {
+                        *selected_icon = 2;
+                        *open_app      = 2;
+                        term_reset(&g_term);
+                    }
+                    term_add_line(&g_term, "LightOS 4 demo desktop kernel.");
+                    handled = 1;
+                } else if (index == 3 && *open_app >= 0) {
+                    // Close whatever app is open
+                    *open_app = -1;
+                    handled   = 1;
+                }
+            }
+
+            g_context_menu_open = 0;
+            if (need_redraw) *need_redraw = 1;
+            if (handled) return;
+        } else {
+            // Click outside context menu closes it and falls through to normal handling.
+            g_context_menu_open = 0;
+            if (need_redraw) *need_redraw = 1;
+        }
+    }
+
+    // Right-click anywhere on the desktop opens the context menu.
+    if (right && !left) {
+        g_context_menu_open = 1;
+        g_context_menu_x = mouse_x;
+        g_context_menu_y = mouse_y;
+        if (need_redraw) *need_redraw = 1;
+        return;
+    }
 
     // Start button bounds
     uint32_t sx = 8;
@@ -1686,7 +1835,6 @@ static void handle_mouse_click(int mouse_x, int mouse_y,
         (uint32_t)mouse_x >= sx && (uint32_t)mouse_x < sx + sw &&
         (uint32_t)mouse_y >= sy && (uint32_t)mouse_y < sy + sh) {
         g_start_open = !g_start_open;
-        handled = 1;
         if (need_redraw) *need_redraw = 1;
         return;
     }
@@ -1703,25 +1851,15 @@ static void handle_mouse_click(int mouse_x, int mouse_y,
 
             uint32_t ax = mx + 16;
             uint32_t ay = my + 40;
-            uint32_t row_h = 16;
-            int index = -1;
+            uint32_t item_h = 20;
 
-            for (int i = 0; i < 4; ++i) {
-                uint32_t ry0 = ay + (uint32_t)i * row_h;
-                uint32_t ry1 = ry0 + row_h;
-                if ((uint32_t)mouse_x >= ax && (uint32_t)mouse_x < mx + w - 16 &&
-                    (uint32_t)mouse_y >= ry0 && (uint32_t)mouse_y < ry1) {
-                    index = i;
-                    break;
-                }
-            }
-
-            if (index >= 0) {
-                *selected_icon = index;
-                *open_app      = index;
-                if (*open_app == 2) {
-                    term_reset(&g_term);
-                }
+            // For now just one visible item: Command Block
+            if (left &&
+                (uint32_t)mouse_x >= ax && (uint32_t)mouse_x < ax + w - 32 &&
+                (uint32_t)mouse_y >= ay && (uint32_t)mouse_y < ay + item_h) {
+                *selected_icon = 2;
+                *open_app      = 2;
+                term_reset(&g_term);
                 g_start_open = 0;
                 handled = 1;
                 if (need_redraw) *need_redraw = 1;
@@ -1738,6 +1876,7 @@ static void handle_mouse_click(int mouse_x, int mouse_y,
 
     if (!handled) {
         g_start_open = 0; // any non-start click closes the menu
+        g_context_menu_open = 0;
     }
 
     // Dock icons (left column)
@@ -1774,13 +1913,12 @@ static void handle_mouse_click(int mouse_x, int mouse_y,
         if (win_y < 10) win_y = 10;
 
         uint32_t title_h = 24;
-
-        // Close button in title bar
         uint32_t bx = win_x + win_w - 20;
         uint32_t by = win_y + 4;
         uint32_t bw = 14;
         uint32_t bh = 14;
 
+        // Close button
         if ((uint32_t)mouse_x >= bx && (uint32_t)mouse_x < bx + bw &&
             (uint32_t)mouse_y >= by && (uint32_t)mouse_y < by + bh) {
             *open_app = -1;
@@ -1795,7 +1933,6 @@ static void handle_mouse_click(int mouse_x, int mouse_y,
         }
     }
 }
-
 // ---------------------------------------------------------------------
 // Desktop keyboard navigation (arrows, Start toggle)
 // ---------------------------------------------------------------------
@@ -1830,7 +1967,8 @@ static void handle_nav_scancode(uint8_t sc,
 // ---------------------------------------------------------------------
 
 static int mouse_cycle = 0;
-static uint8_t mouse_bytes[3];
+static uint8_t mouse_bytes[4];
+static int g_mouse_has_wheel = 0;
 
 static void ps2_wait_write(void) {
     // Wait until controller input buffer clear
@@ -1857,74 +1995,134 @@ static void ps2_mouse_process_byte(uint8_t data,
                                    int *selected_icon,
                                    int *open_app,
                                    int *need_redraw) {
+    int needed_bytes = g_mouse_has_wheel ? 4 : 3;
+
     if (mouse_cycle == 0) {
-        // First byte: always has bit 3 set in PS/2 packet; if not, resync
+        // First byte of a PS/2 packet should always have bit 3 set.
+        // If not, drop it to resync.
         if (!(data & 0x08)) {
             return;
         }
         mouse_bytes[0] = data;
         mouse_cycle = 1;
-    } else if (mouse_cycle == 1) {
-        mouse_bytes[1] = data;
-        mouse_cycle = 2;
-    } else {
-        mouse_bytes[2] = data;
-        mouse_cycle = 0;
+        return;
+    }
 
-        int8_t dx = (int8_t)mouse_bytes[1];
-        int8_t dy = (int8_t)mouse_bytes[2];
+    mouse_bytes[mouse_cycle] = data;
+    mouse_cycle++;
 
-        g_mouse.x += dx;
-        g_mouse.y -= dy; // invert: PS/2 positive is up, screen y grows down
+    if (mouse_cycle < needed_bytes) {
+        return;
+    }
 
-        if (g_mouse.x < 0) g_mouse.x = 0;
-        if (g_mouse.y < 0) g_mouse.y = 0;
-        if ((uint32_t)g_mouse.x >= g_width)  g_mouse.x = (int32_t)g_width - 1;
-        if ((uint32_t)g_mouse.y >= g_height) g_mouse.y = (int32_t)g_height - 1;
+    // We have a full packet (3-byte classic or 4-byte IntelliMouse).
+    mouse_cycle = 0;
 
-        uint8_t new_left  = (mouse_bytes[0] & 0x01) ? 1u : 0u;
-        uint8_t new_right = (mouse_bytes[0] & 0x02) ? 1u : 0u;
+    int8_t dx = (int8_t)mouse_bytes[1];
+    int8_t dy = (int8_t)mouse_bytes[2];
+    int8_t wheel = 0;
 
-        g_mouse.left_down  = new_left;
-        g_mouse.right_down = new_right;
+    if (g_mouse_has_wheel && needed_bytes == 4) {
+        wheel = (int8_t)mouse_bytes[3];
+    }
 
-        // Edge-triggered click handling
-        if (selected_icon && open_app) {
-            if (new_left && !g_prev_left) {
-                handle_mouse_click(g_mouse.x, g_mouse.y,
-                                   1, 0,
-                                   selected_icon, open_app,
-                                   need_redraw);
-            } else if (new_right && !g_prev_right) {
-                handle_mouse_click(g_mouse.x, g_mouse.y,
-                                   0, 1,
-                                   selected_icon, open_app,
-                                   need_redraw);
-            }
+    // Update mouse position. In PS/2 packets, positive Y is up, but our
+    // framebuffer origin is top-left, so subtract dy.
+    g_mouse.x += dx;
+    g_mouse.y -= dy;
+
+    if (g_mouse.x < 0) g_mouse.x = 0;
+    if (g_mouse.y < 0) g_mouse.y = 0;
+    if ((uint32_t)g_mouse.x >= g_width)  g_mouse.x = (int32_t)g_width - 1;
+    if ((uint32_t)g_mouse.y >= g_height) g_mouse.y = (int32_t)g_height - 1;
+
+    uint8_t new_left  = (mouse_bytes[0] & 0x01) ? 1u : 0u;
+    uint8_t new_right = (mouse_bytes[0] & 0x02) ? 1u : 0u;
+
+    g_mouse.left_down  = new_left;
+    g_mouse.right_down = new_right;
+
+    // Scroll wheel → browser scrolling (only when Browser app is open).
+    if (wheel != 0 && open_app && *open_app == 3) {
+        if (wheel > 0) {
+            g_browser_scroll -= 3;
+        } else if (wheel < 0) {
+            g_browser_scroll += 3;
         }
-
-        g_prev_left  = new_left;
-        g_prev_right = new_right;
-
+        if (g_browser_scroll < 0) g_browser_scroll = 0;
+        // No strict upper bound; draw_browser_contents() will just stop
+        // rendering once the text runs out.
         if (need_redraw) *need_redraw = 1;
     }
+
+    // Edge-triggered click handling
+    if (selected_icon && open_app) {
+        if (new_left && !g_prev_left) {
+            handle_mouse_click(g_mouse.x, g_mouse.y,
+                               1, 0,
+                               selected_icon, open_app,
+                               need_redraw);
+        } else if (new_right && !g_prev_right) {
+            handle_mouse_click(g_mouse.x, g_mouse.y,
+                               0, 1,
+                               selected_icon, open_app,
+                               need_redraw);
+        }
+    }
+
+    g_prev_left  = new_left;
+    g_prev_right = new_right;
+
+    if (need_redraw) *need_redraw = 1;
 }
-
-
 static void ps2_mouse_init(void) {
     // Enable auxiliary device (mouse)
     ps2_wait_write();
     outb(0x64, 0xA8);
 
-    // Enable data reporting
-    ps2_write_mouse(0xF4);
-    // Read and ignore ACK
+    // Put mouse into default state, then enable streaming
+    ps2_write_mouse(0xF6);  // Set default settings
+    ps2_wait_read();
+    (void)inb(0x60);        // ACK
+
+    ps2_write_mouse(0xF4);  // Enable data reporting
+    ps2_wait_read();
+    (void)inb(0x60);        // ACK
+
+    // Try to enable IntelliMouse-compatible scroll wheel.
+    // This is the classic "magic" sample-rate sequence: 200, 100, 80.
+    ps2_write_mouse(0xF3);
+    ps2_wait_read();
+    (void)inb(0x60);
+    ps2_write_mouse(200);
     ps2_wait_read();
     (void)inb(0x60);
 
+    ps2_write_mouse(0xF3);
+    ps2_wait_read();
+    (void)inb(0x60);
+    ps2_write_mouse(100);
+    ps2_wait_read();
+    (void)inb(0x60);
+
+    ps2_write_mouse(0xF3);
+    ps2_wait_read();
+    (void)inb(0x60);
+    ps2_write_mouse(80);
+    ps2_wait_read();
+    (void)inb(0x60);
+
+    // Ask for device ID to see if the wheel mode took.
+    ps2_write_mouse(0xF2);  // Get device ID
+    ps2_wait_read();
+    (void)inb(0x60);        // ACK
+    ps2_wait_read();
+    uint8_t id = inb(0x60);
+
+    g_mouse_has_wheel = (id == 3) ? 1 : 0;
+
     mouse_cycle = 0;
 }
-
 // ---------------------------------------------------------------------
 // Unified PS/2 poll: routes bytes to mouse or keyboard
 // ---------------------------------------------------------------------
