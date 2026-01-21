@@ -266,7 +266,7 @@ static inline void outb(uint16_t port, uint8_t val) {
 }
 
 // ---------------------------------------------------------------------
-// RTC (CMOS) – get real date/time from hardware
+// RTC (CMOS) â€“ get real date/time from hardware
 // ---------------------------------------------------------------------
 
 #define CMOS_ADDR 0x70
@@ -381,7 +381,7 @@ static void format_date(char *buf, uint32_t max) {
 }
 
 // ---------------------------------------------------------------------
-// Boot splash – simple logo + spinner (no libm)
+// Boot splash â€“ simple logo + spinner (no libm)
 // ---------------------------------------------------------------------
 
 static void run_boot_splash(void) {
@@ -505,6 +505,12 @@ typedef struct {
 } TerminalState;
 
 static TerminalState g_term;
+
+// Simple in-terminal editor state (for nano/micro/edit/notepad)
+// When g_editor_active is non-zero, Enter appends lines to the current file
+// instead of executing commands, until the user types :wq, :q, or exit.
+static int g_editor_active     = 0;
+static int g_editor_file_index = -1;
 
 // Simple RAM "filesystem"
 #define VFS_MAX_NODES   128
@@ -751,6 +757,7 @@ static void term_execute_command(TerminalState *t, const char *cmd) {
         term_add_line(t, "  touch / create / mkfile <name>");
         term_add_line(t, "  del / erase / rm <name>");
         term_add_line(t, "  type / cat <file>");
+        term_add_line(t, "  edit / nano / micro / notepad <file>");
         term_add_line(t, "  copy / cp <src> <dst>");
         term_add_line(t, "  move / mv <src> <dst>");
         term_add_line(t, "  pwd");
@@ -909,6 +916,64 @@ static void term_execute_command(TerminalState *t, const char *cmd) {
         return;
     }
 
+
+    // edit / nano / micro / notepad
+    if (str_eq(word, "edit") || str_eq(word, "nano") ||
+        str_eq(word, "micro") || str_eq(word, "notepad")) {
+        char name[64];
+        rest = next_word(rest, name, sizeof(name));
+        if (!name[0]) {
+            term_add_line(t, "edit: usage: edit <file>");
+            return;
+        }
+
+        int idx = vfs_find_child(g_cwd, name);
+        if (idx < 0) {
+            idx = vfs_add_node(VFS_FILE, g_cwd, name);
+            if (idx < 0) {
+                term_add_line(t, "edit: no space left in VFS.");
+                return;
+            }
+            g_vfs[idx].content[0] = '\0';
+        } else if (g_vfs[idx].type != VFS_FILE) {
+            term_add_line(t, "edit: target is not a file.");
+            return;
+        }
+
+        g_editor_active     = 1;
+        g_editor_file_index = idx;
+
+        char header[TERM_MAX_COLS];
+        str_copy(header, "[editor] Editing ", TERM_MAX_COLS);
+        str_cat(header, name, TERM_MAX_COLS);
+        term_add_line(t, header);
+        term_add_line(t, "[editor] Type text, Enter = new line.");
+        term_add_line(t, "[editor] Type :wq, :q, or exit on a line by itself to quit.");
+        term_add_line(t, "[editor] Current contents:");
+
+        if (!g_vfs[idx].content[0]) {
+            term_add_line(t, "(empty file)");
+        } else {
+            char buf[VFS_CONTENT_LEN];
+            str_copy(buf, g_vfs[idx].content, sizeof(buf));
+            char *p = buf;
+            while (*p) {
+                char *linep = p;
+                while (*p && *p != '\n') ++p;
+                char saved = *p;
+                *p = '\0';
+                term_add_line(t, linep);
+                if (saved == '\n') {
+                    *p = saved;
+                    ++p;
+                }
+            }
+        }
+
+        term_add_line(t, "[editor] --- begin editing ---");
+        return;
+    }
+
     // copy / cp
     if (str_eq(word, "copy") || str_eq(word, "cp")) {
         char src[64], dst[64];
@@ -1015,7 +1080,7 @@ static void term_execute_command(TerminalState *t, const char *cmd) {
 }
 
 // ---------------------------------------------------------------------
-// Keyboard input → terminal
+// Keyboard input â†’ terminal
 // ---------------------------------------------------------------------
 
 static int g_shift_down = 0;
@@ -1053,6 +1118,47 @@ static void term_handle_scancode(uint8_t sc, TerminalState *t,
     if (sc == 0x1C) { // Enter
         t->input[t->input_len] = '\0';
 
+        // If a simple editor session is active, append this line to the file
+        // instead of executing a command.
+        if (g_editor_active &&
+            g_editor_file_index >= 0 &&
+            g_editor_file_index < g_vfs_count &&
+            g_vfs[g_editor_file_index].type == VFS_FILE) {
+
+            // Show the line inside the editor without a prompt
+            term_add_line(t, t->input);
+
+            // Exit commands for the editor
+            if (str_eq(t->input, ":wq") ||
+                str_eq(t->input, ":q")  ||
+                str_eq(t->input, ":q!") ||
+                str_eq(t->input, "exit")) {
+                g_editor_active     = 0;
+                g_editor_file_index = -1;
+                term_add_line(t, "[editor] exited.");
+            } else {
+                VfsNode *node = &g_vfs[g_editor_file_index];
+                uint32_t cur_len = str_len(node->content);
+                if (cur_len >= VFS_CONTENT_LEN - 2) {
+                    term_add_line(t, "[editor] file too large, cannot append.");
+                } else {
+                    if (cur_len > 0) {
+                        node->content[cur_len++] = '\n';
+                    }
+                    uint32_t i = 0;
+                    while (t->input[i] && cur_len < VFS_CONTENT_LEN - 1) {
+                        node->content[cur_len++] = t->input[i++];
+                    }
+                    node->content[cur_len] = '\0';
+                }
+            }
+
+            t->input_len = 0;
+            t->input[0]  = '\0';
+            return;
+        }
+
+        // Normal command-mode behavior
         char prompt[TERM_MAX_COLS];
         term_print_prompt_path(prompt, sizeof(prompt));
         char line[TERM_MAX_COLS];
@@ -1149,7 +1255,7 @@ static int g_context_menu_y = 0;
 static void draw_desktop(int selected_icon, int open_app);
 static void draw_context_menu(int open_app);
 
-// Desktop background – ChromeOS-ish flat gradient
+// Desktop background â€“ ChromeOS-ish flat gradient
 static void draw_desktop_background(void) {
     for (uint32_t y = 0; y < g_height; ++y) {
         uint8_t shade = (uint8_t)(0x20 + (y * 80 / (g_height ? g_height : 1)));
@@ -1429,7 +1535,7 @@ static void draw_fileblock_contents(uint32_t win_x, uint32_t win_y,
 }
 
 // ---------------------------------------------------------------------
-// Browser (stub – tabs + address bar + content, no real network yet)
+// Browser (stub â€“ tabs + address bar + content, no real network yet)
 // ---------------------------------------------------------------------
 
 typedef struct {
@@ -1555,7 +1661,7 @@ static void draw_window(uint32_t win_x, uint32_t win_y,
     fill_rect(win_x, win_y, win_w, title_h, 0x303840u);
     draw_text(win_x + 8, win_y + 6, title, 0xFFFFFFu, 1);
 
-    // (Close button – not wired)
+    // (Close button â€“ not wired)
     uint32_t bx = win_x + win_w - 20;
     uint32_t by = win_y + 4;
     fill_rect(bx, by, 14, 14, 0xAA0000u);
@@ -1661,7 +1767,7 @@ static void draw_desktop(int selected_icon, int open_app) {
 
 
 // ---------------------------------------------------------------------
-// Mouse → UI hit-testing (icons, Start menu, windows, browser)
+// Mouse â†’ UI hit-testing (icons, Start menu, windows, browser)
 // ---------------------------------------------------------------------
 
 static void handle_browser_click(uint32_t win_x, uint32_t win_y,
@@ -1868,7 +1974,7 @@ static void handle_mouse_click(int mouse_x, int mouse_y,
 
             handled = 1; // click inside menu but not on an item; keep it open
         } else {
-            // Click outside the menu → close it
+            // Click outside the menu â†’ close it
             g_start_open = 0;
             if (need_redraw) *need_redraw = 1;
         }
@@ -2042,7 +2148,7 @@ static void ps2_mouse_process_byte(uint8_t data,
     g_mouse.left_down  = new_left;
     g_mouse.right_down = new_right;
 
-    // Scroll wheel → browser scrolling (only when Browser app is open).
+    // Scroll wheel â†’ browser scrolling (only when Browser app is open).
     if (wheel != 0 && open_app && *open_app == 3) {
         if (wheel > 0) {
             g_browser_scroll -= 3;
