@@ -1766,6 +1766,29 @@ static void draw_desktop(int selected_icon, int open_app) {
 }
 
 
+
+
+static void draw_command_block_window(int selected_icon, int open_app) {
+    (void)selected_icon; // currently unused
+
+    if (open_app != 2) {
+        // Only Command Block uses the text terminal window.
+        return;
+    }
+
+    uint32_t win_w = g_width * 3 / 5;
+    uint32_t win_h = g_height * 3 / 5;
+    uint32_t win_x = (g_width  - win_w) / 2;
+    uint32_t win_y = (g_height - win_h) / 2 - g_height / 20;
+    if (win_y < 10) win_y = 10;
+
+    const char *title = "Command Block";
+    draw_window(win_x, win_y, win_w, win_h, title, open_app);
+
+    // Cursor on top of everything
+    draw_mouse_cursor();
+}
+
 // ---------------------------------------------------------------------
 // Mouse â†’ UI hit-testing (icons, Start menu, windows, browser)
 // ---------------------------------------------------------------------
@@ -2100,7 +2123,7 @@ static void ps2_write_mouse(uint8_t val) {
 static void ps2_mouse_process_byte(uint8_t data,
                                    int *selected_icon,
                                    int *open_app,
-                                   int *need_redraw) {
+                                   int *need_full_redraw) {
     int needed_bytes = g_mouse_has_wheel ? 4 : 3;
 
     if (mouse_cycle == 0) {
@@ -2158,7 +2181,7 @@ static void ps2_mouse_process_byte(uint8_t data,
         if (g_browser_scroll < 0) g_browser_scroll = 0;
         // No strict upper bound; draw_browser_contents() will just stop
         // rendering once the text runs out.
-        if (need_redraw) *need_redraw = 1;
+        if (need_full_redraw) *need_full_redraw = 1;
     }
 
     // Edge-triggered click handling
@@ -2167,19 +2190,19 @@ static void ps2_mouse_process_byte(uint8_t data,
             handle_mouse_click(g_mouse.x, g_mouse.y,
                                1, 0,
                                selected_icon, open_app,
-                               need_redraw);
+                               need_full_redraw);
         } else if (new_right && !g_prev_right) {
             handle_mouse_click(g_mouse.x, g_mouse.y,
                                0, 1,
                                selected_icon, open_app,
-                               need_redraw);
+                               need_full_redraw);
         }
     }
 
     g_prev_left  = new_left;
     g_prev_right = new_right;
 
-    if (need_redraw) *need_redraw = 1;
+    if (need_full_redraw) *need_full_redraw = 1;
 }
 static void ps2_mouse_init(void) {
     // Enable auxiliary device (mouse)
@@ -2233,26 +2256,36 @@ static void ps2_mouse_init(void) {
 // Unified PS/2 poll: routes bytes to mouse or keyboard
 // ---------------------------------------------------------------------
 
-static void ps2_poll(int *selected_icon, int *open_app, int *need_redraw) {
+static void ps2_poll(int *selected_icon, int *open_app,
+                     int *need_full_redraw,
+                     int *need_cmd_redraw) {
     uint8_t status = inb(0x64);
-    if (!(status & 0x01)) return; // no data
+    if (!(status & 0x01)) return; // no data pending
 
     uint8_t data = inb(0x60);
 
     if (status & 0x20) {
-        // Mouse data
-        ps2_mouse_process_byte(data, selected_icon, open_app, need_redraw);
+        // Mouse data (always trigger a full desktop redraw when mouse moves
+        // or clicks, since the cursor and potentially UI state changes).
+        ps2_mouse_process_byte(data, selected_icon, open_app, need_full_redraw);
     } else {
         // Keyboard scancode
         if (*open_app == 2) {
+            // Command Block (terminal) is active: only redraw the terminal
+            // window instead of the entire desktop to avoid flicker.
             term_handle_scancode(data, &g_term, selected_icon, open_app);
+            if (need_cmd_redraw) {
+                *need_cmd_redraw = 1;
+            }
         } else {
+            // Desktop navigation / other apps: desktop layout may have changed.
             handle_nav_scancode(data, selected_icon, open_app);
+            if (need_full_redraw) {
+                *need_full_redraw = 1;
+            }
         }
-        *need_redraw = 1;
     }
 }
-
 // ---------------------------------------------------------------------
 // Kernel entry
 // ---------------------------------------------------------------------
@@ -2295,12 +2328,19 @@ void kernel_main(BootInfo *bi) {
     draw_desktop(selected_icon, open_app);
 
     for (;;) {
-        int need_redraw = 0;
+        int need_full_redraw = 0;
+        int need_cmd_redraw  = 0;
 
-        ps2_poll(&selected_icon, &open_app, &need_redraw);
+        ps2_poll(&selected_icon, &open_app,
+                 &need_full_redraw,
+                 &need_cmd_redraw);
 
-        if (need_redraw) {
+        if (need_full_redraw) {
             draw_desktop(selected_icon, open_app);
+        } else if (need_cmd_redraw) {
+            // Only Command Block content changed â€“ redraw just that window
+            // to avoid repainting the entire desktop every keypress.
+            draw_command_block_window(selected_icon, open_app);
         }
     }
 }
