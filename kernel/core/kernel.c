@@ -469,21 +469,86 @@ static MouseState g_mouse = { 80, 80, 0, 0 };
 static uint8_t g_prev_left  = 0;
 static uint8_t g_prev_right = 0;
 
-// Draw simple arrow cursor
+// Cursor overlay state. We draw the cursor as a small "layer" on top of the
+// framebuffer by saving the background pixels under it and restoring them
+// when the cursor moves, instead of repainting the entire desktop.
+#define CURSOR_W 16
+#define CURSOR_H 16
+
+static uint32_t g_cursor_bg[CURSOR_W * CURSOR_H];
+static int32_t  g_cursor_prev_x = 0;
+static int32_t  g_cursor_prev_y = 0;
+static int      g_cursor_bg_valid = 0;
+
+// Invalidate any saved cursor background. Call this whenever the desktop is
+// being completely redrawn.
+static void cursor_invalidate(void) {
+    g_cursor_bg_valid = 0;
+}
+
+// Draw simple arrow cursor using an overlay technique:
+//  1) Restore the background under the old cursor (if valid).
+//  2) Capture the background under the new cursor position.
+//  3) Draw the arrow on top.
 static void draw_mouse_cursor(void) {
     const uint32_t col_fg = 0xFFFFFFu;
     const uint32_t col_bd = 0x000000u;
+
     int32_t base_x = g_mouse.x;
     int32_t base_y = g_mouse.y;
-    int32_t h = 16;
+    int32_t h      = 16;
 
+    // Step 1: restore background under previous cursor position.
+    if (g_cursor_bg_valid) {
+        for (int32_t row = 0; row < h; ++row) {
+            for (int32_t col = 0; col < h; ++col) {
+                int32_t x = g_cursor_prev_x + col;
+                int32_t y = g_cursor_prev_y + row;
+                if (x < 0 || y < 0 ||
+                    (uint32_t)x >= g_width ||
+                    (uint32_t)y >= g_height)
+                    continue;
+                uint32_t c = g_cursor_bg[row * CURSOR_W + col];
+                g_fb[(uint64_t)y * g_pitch + (uint32_t)x] = c;
+            }
+        }
+        g_cursor_bg_valid = 0;
+    }
+
+    // Clamp target position to the visible screen.
+    if (base_x < 0) base_x = 0;
+    if (base_y < 0) base_y = 0;
+    if ((uint32_t)base_x >= g_width)  base_x = (int32_t)g_width - 1;
+    if ((uint32_t)base_y >= g_height) base_y = (int32_t)g_height - 1;
+
+    // Step 2: capture background under the new cursor square.
+    for (int32_t row = 0; row < h; ++row) {
+        for (int32_t col = 0; col < h; ++col) {
+            int32_t x = base_x + col;
+            int32_t y = base_y + row;
+            uint32_t c = 0;
+            if (x >= 0 && y >= 0 &&
+                (uint32_t)x < g_width &&
+                (uint32_t)y < g_height) {
+                c = g_fb[(uint64_t)y * g_pitch + (uint32_t)x];
+            }
+            g_cursor_bg[row * CURSOR_W + col] = c;
+        }
+    }
+
+    g_cursor_prev_x   = base_x;
+    g_cursor_prev_y   = base_y;
+    g_cursor_bg_valid = 1;
+
+    // Step 3: draw arrow on top of the newly captured background.
     for (int32_t row = 0; row < h; ++row) {
         for (int32_t col = 0; col <= row; ++col) {
             int32_t x = base_x + col;
             int32_t y = base_y + row;
             if (x < 0 || y < 0 ||
                 (uint32_t)x >= g_width ||
-                (uint32_t)y >= g_height) continue;
+                (uint32_t)y >= g_height)
+                continue;
             uint32_t color = (col == 0 || row == 0 || col == row) ? col_bd : col_fg;
             g_fb[(uint64_t)y * g_pitch + (uint32_t)x] = color;
         }
@@ -493,7 +558,6 @@ static void draw_mouse_cursor(void) {
 // ---------------------------------------------------------------------
 // Terminal + VFS
 // ---------------------------------------------------------------------
-
 #define TERM_MAX_LINES 32
 #define TERM_MAX_COLS  80
 
@@ -1734,6 +1798,7 @@ static void draw_context_menu(int open_app) {
 }
 
 static void draw_desktop(int selected_icon, int open_app) {
+    cursor_invalidate();
     draw_desktop_background();
     draw_taskbar();
     draw_icons_column(selected_icon);
@@ -1770,6 +1835,10 @@ static void draw_desktop(int selected_icon, int open_app) {
 
 static void draw_command_block_window(int selected_icon, int open_app) {
     (void)selected_icon; // currently unused
+
+    // Underlying window contents are about to be redrawn; discard any
+    // saved cursor background so we don't restore stale pixels.
+    cursor_invalidate();
 
     if (open_app != 2) {
         // Only Command Block uses the text terminal window.
@@ -2202,7 +2271,14 @@ static void ps2_mouse_process_byte(uint8_t data,
     g_prev_left  = new_left;
     g_prev_right = new_right;
 
-    if (need_full_redraw) *need_full_redraw = 1;
+    // If a click or scroll event requested a full redraw, the main loop
+    // will call draw_desktop(), which in turn will redraw the cursor on top.
+    // For pure movement, avoid repainting the entire desktop and instead
+    // just move the cursor overlay.
+    int requested = (need_full_redraw && *need_full_redraw);
+    if (!requested) {
+        draw_mouse_cursor();
+    }
 }
 static void ps2_mouse_init(void) {
     // Enable auxiliary device (mouse)
@@ -2265,8 +2341,9 @@ static void ps2_poll(int *selected_icon, int *open_app,
     uint8_t data = inb(0x60);
 
     if (status & 0x20) {
-        // Mouse data (always trigger a full desktop redraw when mouse moves
-        // or clicks, since the cursor and potentially UI state changes).
+        // Mouse data: ps2_mouse_process_byte() will decide whether a full
+        // desktop redraw is needed (for clicks/scroll) or whether it can
+        // simply move the cursor overlay for plain motion.
         ps2_mouse_process_byte(data, selected_icon, open_app, need_full_redraw);
     } else {
         // Keyboard scancode
